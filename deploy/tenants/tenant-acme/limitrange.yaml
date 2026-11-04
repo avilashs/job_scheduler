@@ -1,0 +1,22 @@
+# Defaults ensure no BestEffort pods slip past quota accounting. Maximums stop one pod
+# from taking a whole node. maxLimitRequestRatio limits overcommit inside the tenant.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults-and-bounds
+  namespace: tenant-acme
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 1Gi }
+      default:        { cpu: "1",  memory: 2Gi, ephemeral-storage: 4Gi }
+      min:            { cpu: 100m, memory: 128Mi }
+      max:            { cpu: "16", memory: 120Gi, ephemeral-storage: 200Gi, nvidia.com/gpu: "4" }
+      maxLimitRequestRatio:
+        cpu: "4"
+        memory: "1.5"
+    - type: Pod
+      max: { cpu: "17", memory: 128Gi }
+    - type: PersistentVolumeClaim
+      min: { storage: 1Gi }
+      max: { storage: 2Ti }

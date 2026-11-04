@@ -1,0 +1,194 @@
+# Cluster-enforced guardrails (ValidatingAdmissionPolicy, admissionregistration.k8s.io/v1, K8s 1.30+).
+# They hold even if the scheduler has a bug or is compromised. The submitter evaluates the
+# same rules locally before submitting, so violations fail fast with a readable error.
+#
+# Namespaces opt in with the label jobsched.io/tenant=<name>, which only the Tenant Operator can set.
+---
+# 1) SparkApplication shape: fixed ServiceAccounts, scheduler-owned retries, required labels.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-sparkapplication-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - { key: jobsched.io/tenant, operator: Exists }
+    resourceRules:
+      - apiGroups: ["sparkoperator.k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["sparkapplications"]
+  validations:
+    - expression: "has(object.spec.driver.serviceAccount) && object.spec.driver.serviceAccount == 'spark-driver'"
+      message: "driver must run as ServiceAccount spark-driver"
+    - expression: "!has(object.spec.executor.serviceAccount) || object.spec.executor.serviceAccount == 'spark-executor'"
+      message: "executors must run as ServiceAccount spark-executor"
+    - expression: "has(object.spec.restartPolicy) && object.spec.restartPolicy.type == 'Never'"
+      message: "retries are owned by the scheduler; restartPolicy.type must be Never"
+    - expression: >-
+        has(object.spec.driver.labels) && 'jobsched.io/attempt-id' in object.spec.driver.labels &&
+        has(object.spec.executor.labels) && 'jobsched.io/attempt-id' in object.spec.executor.labels &&
+        object.spec.driver.labels['jobsched.io/attempt-id'] == object.spec.executor.labels['jobsched.io/attempt-id']
+      message: "driver and executor must carry the same jobsched.io/attempt-id label"
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath))"
+      message: "hostPath volumes are not allowed"
+    - expression: "has(object.spec.timeToLiveSeconds) && object.spec.timeToLiveSeconds <= 86400"
+      message: "timeToLiveSeconds is required (<= 86400) to keep etcd small"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-sparkapplication-guardrails
+spec:
+  policyName: jobsched-sparkapplication-guardrails
+  validationActions: ["Deny", "Audit"]
+---
+# 2) Pod tier ceiling and hygiene. Every pod must name a PriorityClass the namespace's
+#    jobsched.io/max-tier allows. This prevents priority inflation and stands in for the
+#    ResourceQuota limitedResources flag on managed control planes.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-tier-ceiling
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - { key: jobsched.io/tenant, operator: Exists }
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: pc
+      expression: "has(object.spec.priorityClassName) ? object.spec.priorityClassName : ''"
+    - name: maxTier
+      expression: >-
+        has(namespaceObject.metadata.labels) && 'jobsched.io/max-tier' in namespaceObject.metadata.labels
+        ? namespaceObject.metadata.labels['jobsched.io/max-tier'] : 'adhoc'
+    - name: allowed
+      expression: >-
+        {
+          'critical': ['jobsched-critical-driver','jobsched-critical-executor',
+                       'jobsched-standard-driver','jobsched-standard-executor',
+                       'jobsched-adhoc-driver','jobsched-adhoc-executor'],
+          'standard': ['jobsched-standard-driver','jobsched-standard-executor',
+                       'jobsched-adhoc-driver','jobsched-adhoc-executor'],
+          'adhoc':    ['jobsched-adhoc-driver','jobsched-adhoc-executor']
+        }
+    - name: containers
+      expression: "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"
+  validations:
+    - expression: "variables.maxTier in variables.allowed && variables.pc in variables.allowed[variables.maxTier]"
+      messageExpression: "'priorityClassName \"' + variables.pc + '\" not permitted; namespace max tier is ' + variables.maxTier"
+    - expression: >-
+        !(has(object.spec.hostNetwork) && object.spec.hostNetwork) &&
+        !(has(object.spec.hostPID) && object.spec.hostPID) &&
+        !(has(object.spec.hostIPC) && object.spec.hostIPC)
+      message: "host namespaces are not allowed"
+    - expression: >-
+        variables.containers.all(c, !has(c.env) || c.env.all(e,
+          !has(e.value) ||
+          !(e.name.upperAscii().contains('PASSWORD') || e.name.upperAscii().contains('SECRET') ||
+            e.name.upperAscii().contains('TOKEN') || e.name.upperAscii().contains('API_KEY'))))
+      message: "secret-like env vars must use valueFrom.secretKeyRef, not literal values"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-tier-ceiling
+spec:
+  policyName: jobsched-tier-ceiling
+  validationActions: ["Deny", "Audit"]
+---
+# 3) The submitter may only create per-attempt NetworkPolicies: they select one attempt-id
+#    and allow traffic only to and from pods with that same attempt-id (no namespace/ipBlock peers).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-submitter-networkpolicy-shape
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    - name: is-submitter
+      expression: "request.userInfo.username == 'system:serviceaccount:jobsched-system:jobsched-submitter'"
+  variables:
+    - name: aid
+      expression: >-
+        has(object.spec.podSelector.matchLabels) && 'jobsched.io/attempt-id' in object.spec.podSelector.matchLabels
+        ? object.spec.podSelector.matchLabels['jobsched.io/attempt-id'] : ''
+  validations:
+    - expression: "variables.aid != ''"
+      message: "submitter NetworkPolicies must select a single jobsched.io/attempt-id"
+    - expression: >-
+        !has(object.spec.ingress) || object.spec.ingress.all(r, has(r.from) && r.from.all(p,
+          has(p.podSelector) && !has(p.namespaceSelector) && !has(p.ipBlock) &&
+          has(p.podSelector.matchLabels) && 'jobsched.io/attempt-id' in p.podSelector.matchLabels &&
+          p.podSelector.matchLabels['jobsched.io/attempt-id'] == variables.aid))
+      message: "ingress peers must be pods of the same attempt"
+    - expression: >-
+        !has(object.spec.egress) || object.spec.egress.all(r, has(r.to) && r.to.all(p,
+          has(p.podSelector) && !has(p.namespaceSelector) && !has(p.ipBlock) &&
+          has(p.podSelector.matchLabels) && 'jobsched.io/attempt-id' in p.podSelector.matchLabels &&
+          p.podSelector.matchLabels['jobsched.io/attempt-id'] == variables.aid))
+      message: "egress peers must be pods of the same attempt"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-submitter-networkpolicy-shape
+spec:
+  policyName: jobsched-submitter-networkpolicy-shape
+  validationActions: ["Deny", "Audit"]
+---
+# 4) The Tenant Operator, the only identity that writes quotas and RBAC, is confined to
+#    namespaces labelled as tenants and may bind only the platform's approved roles.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-tenant-operator-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["resourcequotas", "limitranges"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["roles", "rolebindings"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    - name: is-tenant-operator
+      expression: "request.userInfo.username == 'system:serviceaccount:jobsched-system:jobsched-tenant-operator'"
+  validations:
+    - expression: >-
+        has(namespaceObject.metadata.labels) && 'jobsched.io/tenant' in namespaceObject.metadata.labels
+      message: "tenant operator may only write inside tenant namespaces"
+    - expression: >-
+        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
+        object.roleRef.name in ['jobsched-submitter', 'jobsched-tenant-viewer', 'jobsched-tenant-admin', 'spark-driver']
+      message: "rolebinding must reference an approved platform role"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-tenant-operator-scope
+spec:
+  policyName: jobsched-tenant-operator-scope
+  validationActions: ["Deny", "Audit"]

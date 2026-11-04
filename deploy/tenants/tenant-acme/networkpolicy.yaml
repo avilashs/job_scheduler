@@ -1,0 +1,126 @@
+# NetworkPolicies are additive allow-lists. Everything starts from default-deny.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-all, namespace: tenant-acme }
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-dns, namespace: tenant-acme }
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+---
+# Standard mode: driver <-> executor traffic is allowed only inside this namespace.
+# Strict-mode tenants do NOT get this policy; the submitter creates a per-attempt policy instead
+# (examples/per-attempt-networkpolicy.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-spark-intra-namespace, namespace: tenant-acme }
+spec:
+  podSelector:
+    matchExpressions:
+      - { key: spark-role, operator: In, values: ["driver", "executor"] }
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - { key: spark-role, operator: In, values: ["driver", "executor"] }
+      ports:
+        - { protocol: TCP, port: 7078 }   # spark.driver.port
+        - { protocol: TCP, port: 7079 }   # spark.blockManager.port
+        - { protocol: TCP, port: 4040 }   # driver UI (executor heartbeats use RPC port)
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - { key: spark-role, operator: In, values: ["driver", "executor"] }
+      ports:
+        - { protocol: TCP, port: 7078 }
+        - { protocol: TCP, port: 7079 }
+---
+# Only drivers may reach the kube-apiserver (to manage executors).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-driver-to-apiserver, namespace: tenant-acme }
+spec:
+  podSelector:
+    matchLabels: { spark-role: driver }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock: { cidr: 10.0.0.0/28 }  # control-plane endpoint CIDR (from `kubectl get endpoints kubernetes`)
+      ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 6443 }
+---
+# Data plane: all external egress goes through the egress gateway, which enforces the tenant's
+# FQDN allow-list (object store bucket, Kafka, DBs). With Cilium, replace this with toFQDNs rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-egress-data-plane, namespace: tenant-acme }
+spec:
+  podSelector:
+    matchLabels: { jobsched.io/managed: "true" }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: egress-gateway }
+          podSelector:
+            matchLabels: { egress.jobsched.io/tenant: acme }
+      ports:
+        - { protocol: TCP, port: 3128 }
+---
+# Output callbacks to the scheduler API (projected SA token, audience jobsched-api).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-jobsched-callbacks, namespace: tenant-acme }
+spec:
+  podSelector:
+    matchLabels: { jobsched.io/managed: "true" }
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: jobsched-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/component: api }
+      ports:
+        - { protocol: TCP, port: 8443 }
+---
+# Prometheus scraping and the Spark UI proxy (through the scheduler API) are the only inbound paths.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-observability, namespace: tenant-acme }
+spec:
+  podSelector:
+    matchLabels: { jobsched.io/managed: "true" }
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: monitoring }
+          podSelector:
+            matchLabels: { app.kubernetes.io/name: prometheus }
+      ports:
+        - { protocol: TCP, port: 8090 }   # JMX / Prometheus exporter
+    - from:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: jobsched-system }
+          podSelector:
+            matchLabels: { app.kubernetes.io/component: api }
+      ports:
+        - { protocol: TCP, port: 4040 }   # Spark UI proxy

@@ -1,0 +1,57 @@
+# Six PriorityClasses: in every tier the driver ranks above its executors, because
+# losing a driver kills the whole Spark app while losing an executor is recoverable.
+# Critical executors (900k) outrank standard drivers (100k) so SLA work can always reclaim capacity.
+# Ad-hoc work uses preemptionPolicy: Never. It waits for room and never evicts anything.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-critical-driver
+value: 1000000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "Drivers of SLA-bound pipelines. Usage capped per tenant by scoped ResourceQuota."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-critical-executor
+value: 900000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "Executors / pods of SLA-bound pipelines."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-standard-driver
+value: 100000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "Drivers of scheduled production batch."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-standard-executor
+value: 90000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "Executors / pods of scheduled production batch."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-adhoc-driver
+value: 10000
+preemptionPolicy: Never
+globalDefault: false
+description: "Ad-hoc / dev drivers. Never preempts; queues instead."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-adhoc-executor
+value: 1000
+preemptionPolicy: Never
+globalDefault: false
+description: "Ad-hoc / dev executors. First to be evicted."

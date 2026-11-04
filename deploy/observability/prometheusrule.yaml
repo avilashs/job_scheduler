@@ -1,0 +1,114 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: jobsched
+  namespace: monitoring
+  labels: { release: kube-prometheus-stack }
+spec:
+  groups:
+    - name: jobsched.tenant-quota.recording
+      interval: 30s
+      rules:
+        # used / hard for each tenant namespace, quota object and resource (from kube-state-metrics)
+        - record: jobsched:tenant_quota_utilization:ratio
+          expr: |
+            max by (namespace, resourcequota, resource) (kube_resourcequota{type="used", namespace=~"tenant-.*"})
+              / on (namespace, resourcequota, resource)
+            (max by (namespace, resourcequota, resource) (kube_resourcequota{type="hard", namespace=~"tenant-.*"}) > 0)
+        # How far the scheduler's reservation ledger runs ahead of actual usage (dynamic-allocation headroom).
+        - record: jobsched:tenant_ledger_reserved_over_hard:ratio
+          expr: |
+            sum by (tenant, tier, resource) (jobsched_tenant_budget_reserved)
+              / on (tenant, tier, resource)
+            (sum by (tenant, tier, resource) (jobsched_tenant_budget_hard) > 0)
+        - record: jobsched:task_queue_wait_seconds:p95
+          expr: histogram_quantile(0.95, sum by (tenant, tier, le) (rate(jobsched_task_queue_wait_seconds_bucket[5m])))
+        - record: jobsched:dag_run_schedule_delay_seconds:p99
+          expr: histogram_quantile(0.99, sum by (tier, le) (rate(jobsched_dag_run_schedule_delay_seconds_bucket[5m])))
+        - record: jobsched:task_success_ratio:1h
+          expr: |
+            sum by (tenant, tier) (increase(jobsched_task_attempts_total{outcome="success"}[1h]))
+              /
+            (sum by (tenant, tier) (increase(jobsched_task_attempts_total{outcome=~"success|failed"}[1h])) > 0)
+
+    - name: jobsched.tenant.alerts
+      rules:
+        - alert: TenantQuotaNearExhaustion
+          expr: jobsched:tenant_quota_utilization:ratio{resource=~"requests.cpu|requests.memory|requests.nvidia.com/gpu|pods"} > 0.9
+          for: 15m
+          labels: { severity: warning, team: "{{ $labels.namespace }}" }
+          annotations:
+            summary: "{{ $labels.namespace }} at {{ $value | humanizePercentage }} of {{ $labels.resourcequota }}/{{ $labels.resource }}"
+        - alert: TenantTasksStarvedByQuota
+          expr: sum by (tenant) (rate(jobsched_admission_rejections_total{reason="TenantQuotaExhausted"}[10m])) > 0
+                and on (tenant) jobsched:task_queue_wait_seconds:p95{tier="critical"} > 300
+          for: 10m
+          labels: { severity: critical }
+          annotations:
+            summary: "Critical tasks of tenant {{ $labels.tenant }} waiting >5m on quota. Check within-tenant preemption."
+
+    - name: jobsched.scheduler.alerts
+      rules:
+        - alert: JobschedShardsUnowned
+          expr: sum(jobsched_shard_owned) < 256
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "Only {{ $value }} of 256 scheduler shards are owned. DAGs on unowned shards are not being scheduled."
+        - alert: JobschedShardDoubleOwnership
+          expr: sum by (shard) (jobsched_shard_owned) > 1
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "Shard {{ $labels.shard }} reported by >1 replica (fencing protects writes, but investigate lease renewal/clock issues)."
+        - alert: JobschedLeaseRenewFailures
+          expr: sum by (pod) (rate(jobsched_lease_renew_failures_total[5m])) > 0.1
+          for: 5m
+          labels: { severity: warning }
+        - alert: JobschedScheduleDelayHigh
+          expr: jobsched:dag_run_schedule_delay_seconds:p99{tier="critical"} > 60
+          for: 10m
+          labels: { severity: critical }
+          annotations:
+            summary: "p99 schedule delay for critical DAGs is {{ $value | humanizeDuration }}"
+        - alert: JobschedInformerStale
+          expr: max by (pod, resource) (jobsched_informer_last_event_age_seconds) > 600
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "No watch events for {{ $labels.resource }} in 10m on {{ $labels.pod }}. State tracking may be stale."
+        - alert: JobschedWorkqueueBacklog
+          expr: max by (name) (jobsched_workqueue_depth) > 5000
+          for: 10m
+          labels: { severity: warning }
+        - alert: JobschedSubmittedNotRunning
+          expr: sum by (tenant) (jobsched_task_instances{state="submitted"}) > 200
+          for: 15m
+          labels: { severity: warning }
+          annotations:
+            summary: "Many tasks stuck in SUBMITTED for {{ $labels.tenant }}: check Spark Operator shard / scheduling capacity."
+
+    - name: jobsched.apiserver.alerts
+      rules:
+        - alert: JobschedClientThrottled
+          expr: sum by (component) (rate(jobsched_k8s_client_requests_total{code="429"}[5m])) > 1
+          for: 5m
+          labels: { severity: warning }
+        - alert: APFRejectingJobsched
+          expr: sum by (priority_level) (rate(apiserver_flowcontrol_rejected_requests_total{priority_level=~"jobsched|spark-operator|spark-drivers"}[5m])) > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "APF rejecting requests at priority level {{ $labels.priority_level }}"
+        - alert: APFQueueWaitHigh
+          expr: |
+            histogram_quantile(0.99, sum by (priority_level, le) (
+              rate(apiserver_flowcontrol_request_wait_duration_seconds_bucket{priority_level=~"jobsched|spark-drivers"}[5m]))) > 1
+          for: 10m
+          labels: { severity: warning }
+        - alert: EtcdObjectCountHigh
+          expr: max by (resource) (apiserver_storage_objects{resource=~"pods|sparkapplications.sparkoperator.k8s.io|jobs.batch|events"}) > 150000
+          for: 30m
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.resource }} object count {{ $value }}: check TTLs / GC."

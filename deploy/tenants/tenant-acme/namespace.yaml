@@ -1,0 +1,14 @@
+# Rendered by the Tenant Operator from a Tenant resource; never created by hand.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tenant-acme
+  labels:
+    jobsched.io/tenant: acme
+    jobsched.io/max-tier: critical          # critical | standard | adhoc (VAP jobsched-tier-ceiling)
+    jobsched.io/network-mode: standard      # standard | strict (per-attempt NetworkPolicies)
+    jobsched.io/operator-shard: "2"         # which Spark Operator shard watches this namespace
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

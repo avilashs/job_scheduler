@@ -1,0 +1,102 @@
+# What the submitter actually creates for task "ingest", attempt 1 (rendered from examples/dag.yaml).
+# Name = "js-" + base32(sha256(dag_run_id || task || attempt))[:16] + "-a<attempt>": deterministic,
+# so a duplicate submit returns 409 AlreadyExists instead of starting a second copy.
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: js-mfrggzdfmztwq2lk-a1
+  namespace: tenant-acme
+  labels:
+    jobsched.io/managed: "true"
+    jobsched.io/tenant: acme
+    jobsched.io/dag: daily-revenue
+    jobsched.io/task: ingest
+    jobsched.io/run-id: "8812734"
+    jobsched.io/attempt-id: "55120931"
+    jobsched.io/shard-group: "7"
+    jobsched.io/tier: critical
+  annotations:
+    jobsched.io/shard-epoch: "41"          # fencing epoch of the submitting shard owner (forensics)
+    jobsched.io/logical-ts: "2026-11-04T07:00:00Z"
+    jobsched.io/requested-by: "trigger:cron"
+spec:
+  type: Scala
+  mode: cluster
+  sparkVersion: "3.5.3"
+  image: registry.acme.example/spark/ingest:3.5.3-r12
+  imagePullPolicy: IfNotPresent
+  mainClass: com.acme.revenue.Ingest
+  mainApplicationFile: local:///opt/app/ingest.jar
+  arguments: ["--date", "2026-11-03"]
+  restartPolicy:
+    type: Never                            # retries are owned by the scheduler
+  timeToLiveSeconds: 3600                  # operator GCs the CR an hour after it finishes
+  dynamicAllocation:
+    enabled: true
+    initialExecutors: 2
+    minExecutors: 2
+    maxExecutors: 20                       # the admission ledger reserved 20 executors' worth
+  sparkConf:
+    # --- apiserver protection (docs §6.3) ---
+    spark.kubernetes.allocation.batch.size: "10"
+    spark.kubernetes.allocation.batch.delay: "2s"
+    spark.kubernetes.executor.enablePollingWithResourceVersion: "true"
+    spark.kubernetes.executor.apiPollingInterval: "60s"
+    spark.kubernetes.executor.eventProcessingInterval: "5s"
+    # --- graceful preemption of executors ---
+    spark.decommission.enabled: "true"
+    spark.storage.decommission.enabled: "true"
+    spark.storage.decommission.shuffleBlocks.enabled: "true"
+    spark.storage.decommission.rddBlocks.enabled: "true"
+    spark.dynamicAllocation.shuffleTracking.enabled: "true"
+    # --- fixed ports so NetworkPolicy can allow-list them ---
+    spark.driver.port: "7078"
+    spark.blockManager.port: "7079"
+    spark.ui.prometheus.enabled: "true"
+    spark.kubernetes.driver.connectionTimeout: "30000"
+    spark.kubernetes.submission.requestTimeout: "30000"
+  driver:
+    cores: 2
+    coreLimit: "2"
+    memory: 8g
+    serviceAccount: spark-driver
+    priorityClassName: jobsched-critical-driver
+    terminationGracePeriodSeconds: 60
+    labels:
+      jobsched.io/managed: "true"
+      jobsched.io/attempt-id: "55120931"
+      jobsched.io/tier: critical
+    env:
+      - name: JOBSCHED_ATTEMPT_ID
+        value: "55120931"
+    secrets:
+      - { name: lake-credentials, path: /etc/lake, secretType: Generic }
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 185
+      fsGroup: 185
+      seccompProfile: { type: RuntimeDefault }
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }
+  executor:
+    cores: 4
+    coreLimit: "4"
+    memory: 16g
+    serviceAccount: spark-executor
+    priorityClassName: jobsched-critical-executor
+    deleteOnTermination: true
+    labels:
+      jobsched.io/managed: "true"
+      jobsched.io/attempt-id: "55120931"
+      jobsched.io/tier: critical
+    secrets:
+      - { name: lake-credentials, path: /etc/lake, secretType: Generic }
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 185
+      fsGroup: 185
+      seccompProfile: { type: RuntimeDefault }
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: { drop: ["ALL"] }

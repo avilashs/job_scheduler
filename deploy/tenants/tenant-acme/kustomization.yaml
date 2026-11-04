@@ -1,0 +1,10 @@
+# One tenant's complete guardrail bundle. The Tenant Operator renders the same bundle from a
+# Tenant resource, using sizes from the tenant's contract. Apply in this order (namespace first).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - resourcequota.yaml
+  - limitrange.yaml
+  - rbac.yaml
+  - networkpolicy.yaml

@@ -1,0 +1,138 @@
+# Control-plane identities, split by privilege (docs/ARCHITECTURE.md §2.2).
+# None of them has any verb on Secrets.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: jobsched-submitter, namespace: jobsched-system }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: jobsched-watcher, namespace: jobsched-system }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: jobsched-tenant-operator, namespace: jobsched-system }
+---
+# WRITE path. A ClusterRole is used only as a template: it is bound with a RoleBinding
+# inside each onboarded tenant namespace (see deploy/tenants/*/rbac.yaml), never cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-submitter
+rules:
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["create", "get", "delete", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]           # rendered task inputs (non-secret)
+    verbs: ["create", "get", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]      # strict mode per-attempt policies; shape enforced by VAP
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+# READ path. One cluster-wide, label-filtered watch per type (the selector is applied in code).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-watcher
+rules:
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "events", "resourcequotas", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jobsched-watcher
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-watcher }
+subjects:
+  - { kind: ServiceAccount, name: jobsched-watcher, namespace: jobsched-system }
+---
+# Onboarding (privileged). Kept in its own Deployment; confined by the
+# jobsched-tenant-operator-scope ValidatingAdmissionPolicy. Prefer GitOps where possible.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-tenant-operator
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges", "serviceaccounts"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["jobsched-submitter", "jobsched-tenant-viewer", "jobsched-tenant-admin"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["flowcontrol.apiserver.k8s.io"]
+    resources: ["flowschemas"]
+    resourceNames: ["spark-drivers"]
+    verbs: ["get", "update", "patch"]
+  # Needed to grant spark-driver its namespaced Role (RBAC escalation check).
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps", "persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jobsched-tenant-operator
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-tenant-operator }
+subjects:
+  - { kind: ServiceAccount, name: jobsched-tenant-operator, namespace: jobsched-system }
+---
+# Role templates for humans, bound per tenant namespace to OIDC groups.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-tenant-viewer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "configmaps", "resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch"]
+---
+# Break-glass: granted just-in-time (e.g. via an access broker), time-bound.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-tenant-admin
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "configmaps", "resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "delete"]

@@ -1,0 +1,36 @@
+# Strict network mode: one policy per attempt, created by the submitter alongside the
+# SparkApplication. The ownerReference means it is garbage-collected together with the app.
+# Executors of one app cannot reach the driver of another app, even inside the same tenant.
+# The VAP jobsched-submitter-networkpolicy-shape rejects any other shape from the submitter.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: js-mfrggzdfmztwq2lk-a1
+  namespace: tenant-acme
+  labels:
+    jobsched.io/managed: "true"
+    jobsched.io/attempt-id: "55120931"
+  ownerReferences:
+    - apiVersion: sparkoperator.k8s.io/v1beta2
+      kind: SparkApplication
+      name: js-mfrggzdfmztwq2lk-a1
+      uid: 3f1c2b9e-0d7a-4e57-9a3b-2b8f6f1d0c11   # filled in from the create response
+      blockOwnerDeletion: false   # true would need update on sparkapplications/finalizers
+spec:
+  podSelector:
+    matchLabels: { jobsched.io/attempt-id: "55120931" }
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { jobsched.io/attempt-id: "55120931" }
+      ports:
+        - { protocol: TCP, port: 7078 }
+        - { protocol: TCP, port: 7079 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels: { jobsched.io/attempt-id: "55120931" }
+      ports:
+        - { protocol: TCP, port: 7078 }
+        - { protocol: TCP, port: 7079 }

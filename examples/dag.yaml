@@ -1,0 +1,73 @@
+# DAG DSL submitted to the scheduler API (POST /v1/tenants/acme/dags).
+# Published versions are immutable. Runs always pin the version that was current when they started.
+apiVersion: jobsched.io/v1
+kind: Dag
+metadata:
+  name: daily-revenue
+  tenant: acme
+  owners: ["data-eng@acme.example"]
+spec:
+  tier: critical                      # critical | standard | adhoc (capped by the namespace's max-tier)
+  concurrency:
+    maxActiveRuns: 1
+    maxActiveTasks: 8
+  timeout: 4h
+  triggers:
+    - cron:
+        schedule: "0 2 * * *"
+        timezone: America/New_York
+        catchup: false
+        jitterWindow: 0s              # strict SLA: no smearing
+    - kafka:
+        topic: acme.orders.landed     # topic ACL must be owned by tenant acme
+        filter: "event.dataset == 'orders' && event.partition_date != ''"
+        params:
+          partition_date: "{{ event.partition_date }}"
+    - webhook: {}                     # POST /v1/hooks/acme/daily-revenue with HMAC + Idempotency-Key
+  params:
+    partition_date: "{{ logical_date | ds }}"
+  tasks:
+    - name: ingest
+      type: spark
+      retries: { max: 3, backoff: exponential, initialDelay: 60s, maxDelay: 15m }
+      timeout: 90m
+      spark:
+        image: registry.acme.example/spark/ingest:3.5.3-r12
+        mainClass: com.acme.revenue.Ingest
+        mainApplicationFile: local:///opt/app/ingest.jar
+        arguments: ["--date", "{{ params.partition_date }}"]
+        driver:   { cores: 2, memory: 8g }
+        executor: { cores: 4, memory: 16g }
+        dynamicAllocation: { enabled: true, minExecutors: 2, maxExecutors: 20 }
+        secrets:                      # referenced by name only; synced into tenant-acme by External Secrets
+          - { name: lake-credentials, mountPath: /etc/lake }
+      outputs:
+        - row_count                   # written by the driver to /dev/termination-log as JSON
+
+    - name: validate
+      type: container
+      dependsOn: [ingest]
+      retries: { max: 1 }
+      container:
+        image: registry.acme.example/tools/dq:2.4.0
+        args: ["check", "--date", "{{ params.partition_date }}",
+               "--expect-rows", "{{ tasks.ingest.outputs.row_count }}"]
+        resources: { requests: { cpu: "1", memory: 2Gi } }
+
+    - name: aggregate
+      type: spark
+      dependsOn: [validate]
+      spark:
+        image: registry.acme.example/spark/revenue:3.5.3-r12
+        mainApplicationFile: local:///opt/app/aggregate.py
+        type: Python
+        driver:   { cores: 1, memory: 4g }
+        executor: { cores: 4, memory: 16g, instances: 10 }
+
+    - name: notify-failure
+      type: container
+      dependsOn: [ingest, validate, aggregate]
+      triggerRule: one_failed
+      container:
+        image: registry.acme.example/tools/notify:1.0.0
+        args: ["--channel", "#revenue-oncall", "--run", "{{ run.id }}"]

@@ -1,0 +1,114 @@
+# API Priority & Fairness: the scheduler, the Spark Operator and tenant Spark drivers each
+# get their own concurrency share, so none of them can starve kubelets, core controllers,
+# or one another. Requires flowcontrol.apiserver.k8s.io/v1 (Kubernetes 1.29+).
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: jobsched
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 40
+    lendablePercent: 25          # lend idle seats, but keep 75% guaranteed
+    borrowingLimitPercent: 50
+    limitResponse:
+      type: Queue
+      queuing:
+        queues: 64
+        handSize: 6
+        queueLengthLimit: 50
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: jobsched-control-plane
+spec:
+  priorityLevelConfiguration:
+    name: jobsched
+  matchingPrecedence: 1000
+  distinguisherMethod:
+    type: ByUser                 # submitter / watcher / tenant-operator are separate flows
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount: { namespace: jobsched-system, name: "*" }
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+          namespaces: ["*"]
+          clusterScope: true
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: spark-operator
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 30
+    lendablePercent: 25
+    limitResponse:
+      type: Queue
+      queuing: { queues: 32, handSize: 4, queueLengthLimit: 50 }
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: spark-operator
+spec:
+  priorityLevelConfiguration:
+    name: spark-operator
+  matchingPrecedence: 1100
+  distinguisherMethod:
+    type: ByUser
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount: { namespace: spark-operator, name: "*" }
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: ["*"]
+          resources: ["*"]
+          namespaces: ["*"]
+          clusterScope: true
+---
+# Thousands of Spark drivers each create and watch executor pods; together they are the
+# largest source of apiserver load. ByNamespace distinction means one tenant's runaway
+# drivers queue only against themselves. The Tenant Operator adds one subject per tenant namespace.
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: PriorityLevelConfiguration
+metadata:
+  name: spark-drivers
+spec:
+  type: Limited
+  limited:
+    nominalConcurrencyShares: 60
+    lendablePercent: 50
+    limitResponse:
+      type: Queue
+      queuing: { queues: 128, handSize: 6, queueLengthLimit: 100 }
+---
+apiVersion: flowcontrol.apiserver.k8s.io/v1
+kind: FlowSchema
+metadata:
+  name: spark-drivers
+  annotations:
+    jobsched.io/managed-by: tenant-operator
+spec:
+  priorityLevelConfiguration:
+    name: spark-drivers
+  matchingPrecedence: 1200
+  distinguisherMethod:
+    type: ByNamespace
+  rules:
+    - subjects:
+        - kind: ServiceAccount
+          serviceAccount: { namespace: tenant-acme, name: spark-driver }
+        - kind: ServiceAccount
+          serviceAccount: { namespace: tenant-globex, name: spark-driver }
+      resourceRules:
+        - verbs: ["*"]
+          apiGroups: [""]
+          resources: ["pods", "services", "configmaps", "persistentvolumeclaims"]
+          namespaces: ["*"]

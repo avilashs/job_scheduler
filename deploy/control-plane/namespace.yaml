@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jobsched-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    jobsched.io/role: control-plane

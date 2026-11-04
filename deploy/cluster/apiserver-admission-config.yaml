@@ -1,0 +1,17 @@
+# Self-managed control planes only. Pass to kube-apiserver with --admission-control-config-file.
+# With this config, pods using a critical PriorityClass are DENIED in any namespace that lacks a
+# ResourceQuota scoped to that class, so "critical" capacity exists only where it was granted.
+# On managed control planes (EKS/GKE/AKS), the `jobsched-tier-ceiling` ValidatingAdmissionPolicy enforces the same rule.
+apiVersion: apiserver.config.k8s.io/v1
+kind: AdmissionConfiguration
+plugins:
+  - name: ResourceQuota
+    configuration:
+      apiVersion: apiserver.config.k8s.io/v1
+      kind: ResourceQuotaConfiguration
+      limitedResources:
+        - resource: pods
+          matchScopes:
+            - scopeName: PriorityClass
+              operator: In
+              values: ["jobsched-critical-driver", "jobsched-critical-executor"]

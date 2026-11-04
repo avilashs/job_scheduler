@@ -1,0 +1,61 @@
+# 1) Overall ceiling: compute plus object counts (object counts protect etcd and the apiserver).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: compute
+  namespace: tenant-acme
+spec:
+  hard:
+    requests.cpu: "400"
+    limits.cpu: "600"
+    requests.memory: 1600Gi
+    limits.memory: 1800Gi
+    requests.nvidia.com/gpu: "8"
+    requests.ephemeral-storage: 4Ti
+    limits.ephemeral-storage: 6Ti
+    persistentvolumeclaims: "200"
+    requests.storage: 20Ti
+    pods: "1500"
+    services: "300"                     # one headless Service per Spark driver
+    configmaps: "1000"
+    secrets: "200"
+    count/sparkapplications.sparkoperator.k8s.io: "500"
+    count/jobs.batch: "1000"
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+---
+# 2) Tier caps: how much of the ceiling may run at critical priority.
+#    Sum of tier-critical across all tenants <= cluster capacity - system reserve (guaranteed tier).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tier-critical
+  namespace: tenant-acme
+spec:
+  hard:
+    requests.cpu: "120"
+    requests.memory: 480Gi
+    requests.nvidia.com/gpu: "4"
+    pods: "400"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values: ["jobsched-critical-driver", "jobsched-critical-executor"]
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: tier-adhoc
+  namespace: tenant-acme
+spec:
+  hard:
+    requests.cpu: "80"                  # ad-hoc cannot crowd out the tenant's own production
+    requests.memory: 320Gi
+    requests.nvidia.com/gpu: "2"
+    pods: "300"
+  scopeSelector:
+    matchExpressions:
+      - scopeName: PriorityClass
+        operator: In
+        values: ["jobsched-adhoc-driver", "jobsched-adhoc-executor"]
