@@ -1,0 +1,256 @@
+{
+ "_comment": "Executor pod exactly as created by Apache Spark 3.5.3 (client mode, tools/jobsched-spark-submit executor template), captured live; metadata trimmed.",
+ "apiVersion": "v1",
+ "kind": "Pod",
+ "metadata": {
+  "generateName": "fixture-exec-",
+  "namespace": "tenant-acme",
+  "labels": {
+   "app.kubernetes.io/name": "pi-native",
+   "jobsched.io/attempt-id": "pi-native",
+   "jobsched.io/managed": "true",
+   "jobsched.io/tier": "standard",
+   "spark-app-name": "spark-pi",
+   "spark-app-selector": "spark-db5dee217bb643ebb4908f242f0bc4a4",
+   "spark-exec-id": "1",
+   "spark-exec-resourceprofile-id": "0",
+   "spark-role": "executor",
+   "spark-version": "3.5.3"
+  },
+  "annotations": {
+   "kubernetes.io/limit-ranger": "LimitRanger plugin set: ephemeral-storage request for container spark-executor; ephemeral-storage limit for container spark-executor"
+  }
+ },
+ "spec": {
+  "automountServiceAccountToken": false,
+  "containers": [
+   {
+    "args": [
+     "executor"
+    ],
+    "env": [
+     {
+      "name": "SPARK_USER",
+      "value": "root"
+     },
+     {
+      "name": "SPARK_DRIVER_URL",
+      "value": "spark://CoarseGrainedScheduler@driver.invalid:7078"
+     },
+     {
+      "name": "SPARK_EXECUTOR_CORES",
+      "value": "1"
+     },
+     {
+      "name": "SPARK_EXECUTOR_MEMORY",
+      "value": "1024m"
+     },
+     {
+      "name": "SPARK_APPLICATION_ID",
+      "value": "spark-db5dee217bb643ebb4908f242f0bc4a4"
+     },
+     {
+      "name": "SPARK_CONF_DIR",
+      "value": "/opt/spark/conf"
+     },
+     {
+      "name": "SPARK_EXECUTOR_ID",
+      "value": "1"
+     },
+     {
+      "name": "SPARK_RESOURCE_PROFILE_ID",
+      "value": "0"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_0",
+      "value": "-Djava.net.preferIPv6Addresses=false"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_20",
+      "value": "-Dspark.blockManager.port=7079"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_6",
+      "value": "--add-opens=java.base/java.net=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_13",
+      "value": "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_4",
+      "value": "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_18",
+      "value": "-Dspark.driver.port=17078"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_1",
+      "value": "-XX:+IgnoreUnrecognizedVMOptions"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_10",
+      "value": "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_9",
+      "value": "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_7",
+      "value": "--add-opens=java.base/java.nio=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_17",
+      "value": "-Djdk.reflect.useDirectMethodHandle=false"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_11",
+      "value": "--add-opens=java.base/jdk.internal.ref=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_2",
+      "value": "--add-opens=java.base/java.lang=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_16",
+      "value": "--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_8",
+      "value": "--add-opens=java.base/java.util=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_12",
+      "value": "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_15",
+      "value": "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_3",
+      "value": "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_19",
+      "value": "-Dspark.driver.blockManager.port=17079"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_14",
+      "value": "--add-opens=java.base/sun.security.action=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_JAVA_OPT_5",
+      "value": "--add-opens=java.base/java.io=ALL-UNNAMED"
+     },
+     {
+      "name": "SPARK_EXECUTOR_POD_IP",
+      "valueFrom": {
+       "fieldRef": {
+        "apiVersion": "v1",
+        "fieldPath": "status.podIP"
+       }
+      }
+     },
+     {
+      "name": "SPARK_EXECUTOR_POD_NAME",
+      "valueFrom": {
+       "fieldRef": {
+        "apiVersion": "v1",
+        "fieldPath": "metadata.name"
+       }
+      }
+     },
+     {
+      "name": "SPARK_LOCAL_DIRS",
+      "value": "/var/data/spark-121a665c-b871-49e9-9731-70a4bd2f2b5a"
+     }
+    ],
+    "image": "docker.io/library/spark:3.5.3",
+    "imagePullPolicy": "IfNotPresent",
+    "lifecycle": {
+     "preStop": {
+      "exec": {
+       "command": [
+        "/opt/decom.sh"
+       ]
+      }
+     }
+    },
+    "name": "spark-executor",
+    "ports": [
+     {
+      "containerPort": 7079,
+      "name": "blockmanager",
+      "protocol": "TCP"
+     }
+    ],
+    "resources": {
+     "limits": {
+      "cpu": "1",
+      "ephemeral-storage": "4Gi",
+      "memory": "1408Mi"
+     },
+     "requests": {
+      "cpu": "1",
+      "ephemeral-storage": "1Gi",
+      "memory": "1408Mi"
+     }
+    },
+    "securityContext": {
+     "allowPrivilegeEscalation": false,
+     "capabilities": {
+      "drop": [
+       "ALL"
+      ]
+     }
+    },
+    "terminationMessagePath": "/dev/termination-log",
+    "terminationMessagePolicy": "File",
+    "volumeMounts": [
+     {
+      "mountPath": "/opt/spark/conf",
+      "name": "spark-conf-volume-exec"
+     },
+     {
+      "mountPath": "/var/data/spark-121a665c-b871-49e9-9731-70a4bd2f2b5a",
+      "name": "spark-local-dir-1"
+     }
+    ]
+   }
+  ],
+  "dnsPolicy": "ClusterFirst",
+  "enableServiceLinks": false,
+  "hostname": "pi-native-exec-1",
+  "priorityClassName": "jobsched-standard-executor",
+  "restartPolicy": "Never",
+  "schedulerName": "default-scheduler",
+  "securityContext": {
+   "fsGroup": 185,
+   "runAsGroup": 185,
+   "runAsNonRoot": true,
+   "runAsUser": 185,
+   "seccompProfile": {
+    "type": "RuntimeDefault"
+   }
+  },
+  "serviceAccount": "spark-executor",
+  "serviceAccountName": "spark-executor",
+  "terminationGracePeriodSeconds": 30,
+  "volumes": [
+   {
+    "configMap": {
+     "defaultMode": 420,
+     "name": "spark-exec-f7f02ea1a4febdc9-conf-map"
+    },
+    "name": "spark-conf-volume-exec"
+   },
+   {
+    "emptyDir": {},
+    "name": "spark-local-dir-1"
+   }
+  ]
+ }
+}

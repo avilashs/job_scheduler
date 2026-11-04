@@ -29,7 +29,11 @@ expect() {
   local out; out=$(kubectl create --dry-run=server -f "$src" "$@" 2>&1); local rc=$?
   if echo "$out" | grep -q "failed calling webhook"; then bad "$desc (a webhook is unreachable; the result says nothing about policy)" "$(echo "$out" | grep -o 'failed calling webhook "[^"]*"' | head -1)"
   elif [ "$want" = allow ] && [ $rc -eq 0 ]; then ok "$desc"
-  elif [ "$want" = deny ] && [ $rc -ne 0 ]; then ok "$desc  -> $(echo "$out" | grep -oE '(denied|forbidden|Forbidden|must|exceeded|violates|Invalid)[^"]{0,90}' | head -1)"
+  elif [ "$want" = deny ] && [ $rc -ne 0 ]; then
+    # A denial only counts if admission (VAP, RBAC, quota, LimitRange, PSA) produced it. A schema
+    # error or a typo in the test object would otherwise pass as a "correct" denial.
+    local why; why=$(echo "$out" | grep -oE "(denied request|is forbidden|cannot (create|update)|exceeded quota|violates PodSecurity|insufficient quota|must be less than or equal|maximum (cpu|memory)|max limit to request ratio)[^\"]{0,90}" | head -1)
+    if [ -n "$why" ]; then ok "$desc  -> $why"; else bad "$desc (denied, but not by admission)" "$(echo "$out" | head -2)"; fi
   else bad "$desc (wanted $want, rc=$rc)" "$(echo "$out" | head -2)"; fi
 }
 can() { # can yes|no "<desc>" <user> <verb> <resource> [ns] [extra args]
@@ -63,6 +67,31 @@ r = {"apiVersion": "sparkoperator.k8s.io/v1beta2", "kind": "SparkApplication",
      "metadata": {"name": f"{name}-{time.time_ns()}", "namespace": sys.argv[2], "labels": labels},
      "spec": d['spec']['template']}
 exec(sys.argv[3]); print(json.dumps(r))
+PY
+}
+# Native Spark mode: render with the real tool, select one object by kind, optionally mutate it (o).
+native() { # native <Job|CronJob|ConfigMap|DriverPod> <python mutation of o> [tool args...]
+  local kind=$1 mut=$2; shift 2
+  "$ROOT/tools/jobsched-spark-submit" --name np-test --namespace "$NS" --class org.apache.spark.examples.SparkPi \
+      "$@" /opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar 10 | python3 -c '
+import sys, yaml, json
+kind, mut = sys.argv[1], sys.argv[2]
+docs = list(yaml.safe_load_all(sys.stdin))
+if kind == "DriverPod":   # the pod the Job controller creates from the Job template
+    job = next(d for d in docs if d["kind"] == "Job")
+    t = job["spec"]["template"]
+    o = {"apiVersion": "v1", "kind": "Pod",
+         "metadata": {"generateName": "np-test-", "namespace": job["metadata"]["namespace"], "labels": t["metadata"]["labels"]},
+         "spec": t["spec"]}
+else:
+    o = next(d for d in docs if d["kind"] == kind)
+exec(mut); print(json.dumps(o))' "$kind" "$mut"
+}
+# Executor pod exactly as real Spark 3.5.3 built it (test/fixtures), optionally mutated (o).
+spark_executor() { python3 - "$ROOT/test/fixtures/spark-3.5.3-executor-pod.json" "$NS" "${1:-pass}" <<'PY'
+import sys, json
+o = json.load(open(sys.argv[1])); o.pop('_comment', None); o['metadata']['namespace'] = sys.argv[2]
+exec(sys.argv[3]); print(json.dumps(o))
 PY
 }
 pod() { # pod <priorityClass> [python mutation of p]
@@ -121,6 +150,27 @@ can yes "tenant developers can manage their schedules"           dev create sche
 can yes "tenant developers can cancel a run"                     dev delete sparkapplications.sparkoperator.k8s.io $NS --as-group "$DEVG"
 can no  "tenant developers cannot schedule in another namespace" dev create scheduledsparkapplications.sparkoperator.k8s.io default --as-group "$DEVG"
 
+
+echo "== Spark native mode (driver = Job pod in client mode; tools/jobsched-spark-submit)"
+expect allow "rendered executor-template ConfigMap (as submitter)" <(native ConfigMap pass) --as $SUB
+expect allow "rendered Spark driver Job (as submitter)" <(native Job pass) --as $SUB
+expect allow "driver pod the Job controller creates (as spark-driver's namespace)" <(native DriverPod pass)
+expect allow "rendered Spark CronJob (as tenant developer)" <(native CronJob pass --schedule '30 3 * * *' --retries 2) --as dev --as-group $DEVG
+expect deny "Job without ttlSecondsAfterFinished" <(native Job "del o['spec']['ttlSecondsAfterFinished']") --as $SUB
+expect deny "Job with implicit backoffLimit (defaults to 6)" <(native Job "del o['spec']['backoffLimit']") --as $SUB
+expect deny "Job without activeDeadlineSeconds" <(native Job "del o['spec']['activeDeadlineSeconds']") --as $SUB
+expect deny "Job running as the default ServiceAccount" <(native Job "o['spec']['template']['spec']['serviceAccountName']='default'") --as $SUB
+expect deny "every-minute CronJob" <(native CronJob pass --schedule '* * * * *') --as dev --as-group $DEVG
+expect deny "CronJob with concurrencyPolicy Allow" <(native CronJob "o['spec']['concurrencyPolicy']='Allow'" --schedule '30 3 * * *') --as dev --as-group $DEVG
+expect deny "CronJob whose jobTemplate uses the default ServiceAccount" <(native CronJob "o['spec']['jobTemplate']['spec']['template']['spec']['serviceAccountName']='default'" --schedule '30 3 * * *') --as dev --as-group $DEVG
+expect deny "CronJob with 10 retries" <(native CronJob "o['spec']['jobTemplate']['spec']['backoffLimit']=10" --schedule '30 3 * * *') --as dev --as-group $DEVG
+expect allow "real Spark 3.5.3 executor pod, created by spark-driver" <(spark_executor) --as $DRV
+expect deny "real Spark executor without the template's PriorityClass" <(spark_executor "del o['spec']['priorityClassName']") --as $DRV
+expect deny "real Spark executor without the template's securityContext" <(spark_executor "o['spec']['containers'][0].pop('securityContext')") --as $DRV
+expect deny "real Spark executor created with the executor's own token" <(spark_executor) --as $EXE
+can no  "tenant developers cannot create Jobs directly"          dev create jobs.batch $NS --as-group "$DEVG"
+can yes "tenant developers can manage CronJobs"                  dev create cronjobs.batch $NS --as-group "$DEVG"
+\
 echo "== Submitter NetworkPolicy shape (VAP jobsched-submitter-networkpolicy-shape)"
 expect allow "per-attempt policy (as submitter)" <(sed "s/namespace: tenant-acme/namespace: $NS/" "$ROOT/examples/per-attempt-networkpolicy.yaml") --as $SUB
 expect deny "broad allow-all policy (as submitter)" - --as $SUB <<NP

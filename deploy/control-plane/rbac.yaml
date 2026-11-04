@@ -138,12 +138,12 @@ rules:
     resources: ["sparkapplications", "scheduledsparkapplications"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
-    resources: ["jobs"]
+    resources: ["jobs", "cronjobs"]
     verbs: ["get", "list", "watch"]
 ---
-# INTERIM: lets a tenant's own team manage cron schedules for Spark jobs until the scheduler exists.
-# It grants ScheduledSparkApplications only. Teams still cannot create SparkApplications, Jobs or pods
-# directly. Each run executes as the namespace's spark-driver SA, inside the namespace's quotas,
+# INTERIM: lets a tenant's own team manage cron schedules for Spark jobs until the scheduler exists:
+# ScheduledSparkApplications (operator mode) or CronJobs (native mode). Teams still cannot create
+# SparkApplications, Jobs or pods directly. Each run executes as the namespace's spark-driver SA, inside the namespace's quotas,
 # PriorityClass ceiling, PSA and NetworkPolicies. Every template is checked by VAP
 # jobsched-scheduledsparkapplication-guardrails. Remove the binding once DAG scheduling is live.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -157,6 +157,17 @@ rules:
   - apiGroups: ["sparkoperator.k8s.io"]
     resources: ["sparkapplications"]
     verbs: ["get", "list", "watch", "delete"]     # inspect runs; delete = cancel a run
+  # Native mode (tools/jobsched-spark-submit --schedule): CronJob + executor-template ConfigMap.
+  # Job and pod specs are checked by jobsched-cronjob-guardrails / jobsched-job-guardrails / tier ceiling / PSA.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "delete"]     # inspect runs; delete = cancel a run
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
 ---
 # Break-glass: granted just-in-time (e.g. via an access broker), time-bound.
 apiVersion: rbac.authorization.k8s.io/v1

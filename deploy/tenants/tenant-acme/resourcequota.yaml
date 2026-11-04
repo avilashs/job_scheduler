@@ -22,6 +22,7 @@ spec:
     count/sparkapplications.sparkoperator.k8s.io: "500"
     count/scheduledsparkapplications.sparkoperator.k8s.io: "50"
     count/jobs.batch: "1000"
+    count/cronjobs.batch: "50"
     services.loadbalancers: "0"
     services.nodeports: "0"
 ---

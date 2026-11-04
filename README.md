@@ -10,8 +10,9 @@ ValidatingAdmissionPolicy.
 > **Status:** the cluster guardrail layer (priorities, APF, admission policies, RBAC, tenant quotas and
 > policies, Spark Operator values) is verified against a live v1.33 apiserver and ready for staging.
 > The scheduler application itself is **not implemented** yet. See DEPLOYMENT.md §1 for the evidence and gaps.
-> **Spark jobs can be scheduled on cron today** through the Spark Operator, inside all guardrails:
-> see [DEPLOYMENT.md §4](docs/DEPLOYMENT.md#4-scheduling-spark-jobs).
+> **Spark jobs can be scheduled on cron today**, inside all guardrails: through the Spark Operator, or natively as a
+> Kubernetes Job/CronJob whose driver creates its own executor pods (`tools/jobsched-spark-submit`).
+> See [DEPLOYMENT.md §4](docs/DEPLOYMENT.md#4-scheduling-spark-jobs).
 
 | Section | Covers |
 |---|---|
@@ -36,7 +37,8 @@ deploy/spark-operator/               Helm values for one Spark Operator shard
 deploy/tenants/tenant-acme/          Complete per-tenant guardrail bundle (kustomize)
 deploy/observability/                PrometheusRule (recording rules + alerts)
 examples/                            DAG DSL, rendered SparkApplication, scheduled (cron) Spark job, per-attempt NetworkPolicy, SparkPi smoke test
-test/policy-tests.sh                 59 guardrail checks; dry-run only, safe on live clusters
+tools/jobsched-spark-submit          spark-submit-style CLI: renders a Spark driver Job/CronJob (no Spark Operator needed)
+test/policy-tests.sh                 77 guardrail checks (incl. real Spark executor pods); dry-run only, safe on live clusters
 ```
 
 ## Quick start (staging)

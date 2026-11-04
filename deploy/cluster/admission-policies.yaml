@@ -301,3 +301,99 @@ metadata:
 spec:
   policyName: jobsched-scheduledsparkapplication-guardrails
   validationActions: ["Deny", "Audit"]
+---
+# 7) batch/v1 Jobs in tenant namespaces. Covers the scheduler's generic container tasks and
+#    Spark in native mode (driver = Job pod in client mode; tools/jobsched-spark-submit).
+#    Also applies to Jobs the CronJob controller creates. The pods are additionally checked by
+#    jobsched-tier-ceiling and Pod Security.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-job-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - { key: jobsched.io/tenant, operator: Exists }
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+  validations:
+    - expression: "has(object.spec.template.spec.serviceAccountName) && object.spec.template.spec.serviceAccountName in ['spark-driver', 'job-runner']"
+      message: "pods must run as ServiceAccount spark-driver (Spark drivers) or job-runner (other containers)"
+    - expression: "object.spec.template.spec.restartPolicy == 'Never'"
+      message: "restartPolicy must be Never"
+    - expression: "has(object.spec.backoffLimit) && object.spec.backoffLimit <= 3"
+      message: "backoffLimit must be set explicitly and be <= 3 (0 when the scheduler owns retries)"
+    - expression: "has(object.spec.ttlSecondsAfterFinished) && object.spec.ttlSecondsAfterFinished <= 86400"
+      message: "ttlSecondsAfterFinished is required (<= 86400) so finished Jobs and their pods are GC'd"
+    - expression: "has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds <= 86400"
+      message: "activeDeadlineSeconds is required (<= 86400) so a hung run cannot hold quota forever"
+    - expression: >-
+        has(object.spec.template.metadata.labels) && 'jobsched.io/managed' in object.spec.template.metadata.labels &&
+        object.spec.template.metadata.labels['jobsched.io/managed'] == 'true'
+      message: "pod template must carry label jobsched.io/managed=true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-job-guardrails
+spec:
+  policyName: jobsched-job-guardrails
+  validationActions: ["Deny", "Audit"]
+---
+# 8) CronJobs (interim cron for Spark in native mode and for container jobs). Checks the job
+#    template when the schedule is created, and bounds frequency, concurrency and history.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-cronjob-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - { key: jobsched.io/tenant, operator: Exists }
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["cronjobs"]
+  validations:
+    - expression: "size(object.metadata.name) <= 40"
+      message: "name must be <= 40 characters (Jobs are named <name>-<8 digits>, pods add a suffix)"
+    - expression: >-
+        !object.spec.schedule.startsWith('@every') &&
+        !object.spec.schedule.trim().matches('^(\\*|\\*/[1-4]|0-59)(\\s|$)')
+      message: "schedules may run at most every 5 minutes (no '* ...', '*/1-4 ...' or '@every')"
+    - expression: "has(object.spec.concurrencyPolicy) && object.spec.concurrencyPolicy in ['Forbid', 'Replace']"
+      message: "concurrencyPolicy must be Forbid or Replace (Allow lets runs pile up and exhaust quota)"
+    - expression: >-
+        (!has(object.spec.successfulJobsHistoryLimit) || object.spec.successfulJobsHistoryLimit <= 5) &&
+        (!has(object.spec.failedJobsHistoryLimit) || object.spec.failedJobsHistoryLimit <= 5)
+      message: "job history limits must be <= 5"
+    - expression: "has(object.spec.jobTemplate.spec.template.spec.serviceAccountName) && object.spec.jobTemplate.spec.template.spec.serviceAccountName in ['spark-driver', 'job-runner']"
+      message: "jobTemplate: pods must run as ServiceAccount spark-driver (Spark drivers) or job-runner (other containers)"
+    - expression: "object.spec.jobTemplate.spec.template.spec.restartPolicy == 'Never'"
+      message: "jobTemplate: restartPolicy must be Never"
+    - expression: "has(object.spec.jobTemplate.spec.backoffLimit) && object.spec.jobTemplate.spec.backoffLimit <= 3"
+      message: "jobTemplate: backoffLimit must be set explicitly and be <= 3 (0 when the scheduler owns retries)"
+    - expression: "has(object.spec.jobTemplate.spec.ttlSecondsAfterFinished) && object.spec.jobTemplate.spec.ttlSecondsAfterFinished <= 86400"
+      message: "jobTemplate: ttlSecondsAfterFinished is required (<= 86400) so finished Jobs and their pods are GC'd"
+    - expression: "has(object.spec.jobTemplate.spec.activeDeadlineSeconds) && object.spec.jobTemplate.spec.activeDeadlineSeconds <= 86400"
+      message: "jobTemplate: activeDeadlineSeconds is required (<= 86400) so a hung run cannot hold quota forever"
+    - expression: >-
+        has(object.spec.jobTemplate.spec.template.metadata.labels) && 'jobsched.io/managed' in object.spec.jobTemplate.spec.template.metadata.labels &&
+        object.spec.jobTemplate.spec.template.metadata.labels['jobsched.io/managed'] == 'true'
+      message: "jobTemplate: pod template must carry label jobsched.io/managed=true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-cronjob-guardrails
+spec:
+  policyName: jobsched-cronjob-guardrails
+  validationActions: ["Deny", "Audit"]

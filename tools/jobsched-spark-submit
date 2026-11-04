@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""jobsched-spark-submit: spark-submit semantics, rendered as plain Kubernetes objects.
+
+Runs a Spark application WITHOUT the Spark Operator. The driver runs in client mode as the pod
+of a batch/v1 Job (or of a CronJob, with --schedule). Spark's own Kubernetes backend, inside that
+pod, creates the executor pods through the API, using the tenant's spark-driver ServiceAccount.
+
+    tools/jobsched-spark-submit --name daily-pi --namespace tenant-acme --tier standard \\
+        --class org.apache.spark.examples.SparkPi --num-executors 4 \\
+        /opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar 1000 | kubectl apply -f -
+
+Output (multi-document YAML on stdout):
+  * ConfigMap <name>-executor-template: executor pod template (tier PriorityClass, spark-executor SA
+    without a token, restricted securityContext, jobsched labels), mounted into the driver.
+  * Job <name> (default), or CronJob <name> when --schedule is given.
+
+How the pieces fit:
+  * Executors get an ownerReference to the driver pod (spark.kubernetes.driver.pod.name). Deleting
+    the Job, or its TTL expiring, garbage-collects them.
+  * Retries: by default backoffLimit=0, because the jobsched scheduler owns retries. With --retries N
+    (CronJob/interim use, max 3) the Job controller retries. Pod disruption (preemption, eviction)
+    never counts as a failure (podFailurePolicy Ignore on DisruptionTarget).
+  * Every object passes the cluster guardrails (deploy/cluster/admission-policies.yaml).
+
+Only the Python standard library and PyYAML are needed.
+"""
+import argparse
+import math
+import re
+import sys
+
+import yaml
+
+TIERS = ("critical", "standard", "adhoc")
+SPARK_HOME = "/opt/spark"
+TEMPLATE_DIR = "/opt/jobsched"
+TEMPLATE_FILE = "executor-template.yaml"
+SA_TOKEN_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+DRIVER_PORT, BLOCKMANAGER_PORT, UI_PORT = 7078, 7079, 4040
+# Keys the tool owns. Letting --conf override them would break isolation or the guardrails.
+PROTECTED_CONF = re.compile(
+    r"^spark\.(master|submit\.deployMode|kubernetes\.(namespace|driver\.pod\.name|executor\.podTemplate.*|"
+    r"authenticate\..*|container\.image|executor\.podNamePrefix|executor\.label\.jobsched\.io/.*)|"
+    r"driver\.(host|bindAddress|port|blockManager\.port)|blockManager\.port|executor\.(instances|cores|memory))$")
+# Platform defaults that protect the kube-apiserver and make preemption graceful (ARCHITECTURE.md §6.3).
+DEFAULT_CONF = {
+    "spark.kubernetes.allocation.batch.size": "10",
+    "spark.kubernetes.allocation.batch.delay": "2s",
+    "spark.kubernetes.executor.enablePollingWithResourceVersion": "true",
+    "spark.kubernetes.executor.apiPollingInterval": "60s",
+    "spark.kubernetes.executor.deleteOnTermination": "true",
+    "spark.decommission.enabled": "true",
+    "spark.storage.decommission.enabled": "true",
+    "spark.storage.decommission.shuffleBlocks.enabled": "true",
+    "spark.ui.prometheus.enabled": "true",
+    "spark.jars.ivy": "/tmp/.ivy2",
+}
+SECCTX_POD = {"runAsNonRoot": True, "runAsUser": 185, "runAsGroup": 185, "fsGroup": 185,
+              "seccompProfile": {"type": "RuntimeDefault"}}
+SECCTX_CONTAINER = {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+DNS1123 = re.compile(r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+
+
+def mib(size: str) -> int:
+    """Spark size string (512m, 4g, 2048) -> MiB."""
+    m = re.fullmatch(r"(\d+)([kmgt]?)b?", size.strip().lower())
+    if not m:
+        raise SystemExit(f"error: cannot parse memory size {size!r} (use e.g. 512m, 4g)")
+    n, unit = int(m.group(1)), m.group(2) or "m"
+    return {"k": max(1, n // 1024), "m": n, "g": n * 1024, "t": n * 1024 * 1024}[unit]
+
+
+def container_mem(heap_mib: int, factor: float) -> str:
+    """Pod memory = heap + overhead, the same way Spark sizes executor pods: max(factor * heap, 384Mi)."""
+    return f"{heap_mib + max(math.ceil(heap_mib * factor), 384)}Mi"
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="jobsched-spark-submit", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--name", required=True, help="application name (DNS-1123, <= 40 chars)")
+    p.add_argument("--namespace", default="tenant-acme")
+    p.add_argument("--tier", choices=TIERS, default="standard")
+    p.add_argument("--image", default="docker.io/library/spark:3.5.3")
+    p.add_argument("--class", dest="main_class", help="main class (JVM apps)")
+    p.add_argument("--driver-cores", type=int, default=1)
+    p.add_argument("--driver-memory", default="2g")
+    p.add_argument("--executor-cores", type=int, default=2)
+    p.add_argument("--executor-memory", default="4g")
+    p.add_argument("--num-executors", type=int, default=2)
+    p.add_argument("--memory-overhead-factor", type=float, default=0.1)
+    p.add_argument("--conf", action="append", default=[], metavar="KEY=VALUE")
+    p.add_argument("--attempt-id", help="jobsched.io/attempt-id label (default: <name>, or sched-<name> with --schedule)")
+    p.add_argument("--retries", type=int, default=0, help="Job backoffLimit (0 = the scheduler owns retries; max 3)")
+    p.add_argument("--timeout", type=int, default=14400, help="activeDeadlineSeconds per run (default 4h)")
+    p.add_argument("--ttl", type=int, default=3600, help="ttlSecondsAfterFinished (<= 86400)")
+    p.add_argument("--schedule", help="cron expression: emit a CronJob instead of a Job")
+    p.add_argument("--time-zone", default="Etc/UTC", help="CronJob timeZone (IANA name)")
+    p.add_argument("--concurrency-policy", choices=("Forbid", "Replace"), default="Forbid")
+    p.add_argument("application", help="primary resource (container path to jar or .py)")
+    p.add_argument("app_args", nargs=argparse.REMAINDER, help="arguments passed to the application")
+    a = p.parse_args(argv)
+    if not DNS1123.match(a.name) or len(a.name) > 40:
+        p.error("--name must be lowercase DNS-1123 and <= 40 characters")
+    if not 0 <= a.retries <= 3:
+        p.error("--retries must be between 0 and 3")
+    if not 0 < a.ttl <= 86400:
+        p.error("--ttl must be between 1 and 86400")
+    if a.application.startswith("local://"):
+        a.application = a.application[len("local://"):]   # client mode wants a plain path
+    if not a.application.endswith(".py") and not a.main_class:
+        p.error("--class is required for JVM applications")
+    for kv in a.conf:
+        if "=" not in kv:
+            p.error(f"--conf {kv!r}: expected KEY=VALUE")
+        if PROTECTED_CONF.match(kv.split("=", 1)[0]):
+            p.error(f"--conf {kv.split('=', 1)[0]} is set by jobsched-spark-submit and cannot be overridden")
+    return a
+
+
+def render(a):
+    attempt = a.attempt_id or (f"sched-{a.name}" if a.schedule else a.name)
+    labels = {"jobsched.io/managed": "true", "jobsched.io/attempt-id": attempt,
+              "jobsched.io/tier": a.tier, "app.kubernetes.io/name": a.name}
+    cm_name = f"{a.name}-executor-template"
+    exec_mem = container_mem(mib(a.executor_memory), a.memory_overhead_factor)
+    drv_mem = container_mem(mib(a.driver_memory), a.memory_overhead_factor)
+
+    executor_template = {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"labels": dict(labels)},
+        "spec": {
+            "serviceAccountName": "spark-executor",
+            "automountServiceAccountToken": False,
+            "priorityClassName": f"jobsched-{a.tier}-executor",
+            "enableServiceLinks": False,
+            "securityContext": SECCTX_POD,
+            "containers": [{"name": "spark-executor", "securityContext": SECCTX_CONTAINER}],
+        },
+    }
+    configmap = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": cm_name, "namespace": a.namespace, "labels": dict(labels)},
+        "data": {TEMPLATE_FILE: yaml.safe_dump(executor_template, sort_keys=False)},
+    }
+
+    conf = dict(DEFAULT_CONF)
+    conf.update(kv.split("=", 1) for kv in a.conf)
+    conf.update({
+        "spark.kubernetes.namespace": a.namespace,
+        "spark.kubernetes.container.image": a.image,
+        "spark.kubernetes.driver.pod.name": "$(POD_NAME)",       # executors get an ownerReference to it
+        "spark.driver.host": "$(POD_IP)",
+        "spark.driver.bindAddress": "$(POD_IP)",
+        "spark.driver.port": str(DRIVER_PORT),
+        "spark.driver.blockManager.port": str(BLOCKMANAGER_PORT),
+        "spark.blockManager.port": str(BLOCKMANAGER_PORT),
+        "spark.executor.instances": str(a.num_executors),
+        "spark.executor.cores": str(a.executor_cores),
+        "spark.executor.memory": a.executor_memory,
+        "spark.kubernetes.memoryOverheadFactor": str(a.memory_overhead_factor),
+        "spark.kubernetes.executor.request.cores": str(a.executor_cores),
+        "spark.kubernetes.executor.limit.cores": str(a.executor_cores),   # explicit, or LimitRange defaults cap it
+        "spark.kubernetes.executor.podNamePrefix": a.name,
+        "spark.kubernetes.executor.podTemplateFile": f"{TEMPLATE_DIR}/{TEMPLATE_FILE}",
+        "spark.kubernetes.executor.podTemplateContainerName": "spark-executor",
+        "spark.kubernetes.authenticate.executor.serviceAccountName": "spark-executor",
+        "spark.kubernetes.authenticate.caCertFile": f"{SA_TOKEN_DIR}/ca.crt",
+        "spark.kubernetes.authenticate.oauthTokenFile": f"{SA_TOKEN_DIR}/token",
+    })
+    for k, v in labels.items():
+        conf[f"spark.kubernetes.executor.label.{k}"] = v
+
+    args = ["--master", "k8s://https://kubernetes.default.svc:443", "--deploy-mode", "client",
+            "--name", a.name, "--driver-memory", a.driver_memory]
+    if a.main_class:
+        args += ["--class", a.main_class]
+    for k in sorted(conf):
+        args += ["--conf", f"{k}={conf[k]}"]
+    args += [a.application] + list(a.app_args)
+
+    driver_pod = {
+        "metadata": {"labels": {**labels, "spark-role": "driver"}},
+        "spec": {
+            "serviceAccountName": "spark-driver",
+            "priorityClassName": f"jobsched-{a.tier}-driver",
+            "restartPolicy": "Never",
+            "enableServiceLinks": False,
+            "terminationGracePeriodSeconds": 60,
+            "securityContext": SECCTX_POD,
+            "containers": [{
+                "name": "spark-driver",
+                "image": a.image,
+                "command": [f"{SPARK_HOME}/bin/spark-submit"],
+                "args": args,
+                "env": [
+                    {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+                    {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}},
+                    {"name": "HOME", "value": "/tmp"},
+                ],
+                "ports": [{"name": "driver-rpc", "containerPort": DRIVER_PORT},
+                          {"name": "blockmanager", "containerPort": BLOCKMANAGER_PORT},
+                          {"name": "spark-ui", "containerPort": UI_PORT}],
+                "resources": {"requests": {"cpu": str(a.driver_cores), "memory": drv_mem},
+                              "limits": {"cpu": str(a.driver_cores), "memory": drv_mem}},
+                "securityContext": SECCTX_CONTAINER,
+                "volumeMounts": [{"name": "executor-template", "mountPath": TEMPLATE_DIR, "readOnly": True}],
+            }],
+            "volumes": [{"name": "executor-template", "configMap": {"name": cm_name}}],
+        },
+    }
+    job_spec = {
+        "backoffLimit": a.retries,
+        "activeDeadlineSeconds": a.timeout,
+        "ttlSecondsAfterFinished": a.ttl,
+        "podFailurePolicy": {"rules": [
+            # Preemption or eviction is not the app's fault: re-run without using a retry.
+            {"action": "Ignore", "onPodConditions": [{"type": "DisruptionTarget", "status": "True"}]},
+            # Convention: exit code 42 = non-retryable failure (bad input); fail the Job at once.
+            {"action": "FailJob", "onExitCodes": {"containerName": "spark-driver", "operator": "In", "values": [42]}},
+        ]},
+        "template": driver_pod,
+    }
+    if a.schedule:
+        workload = {
+            "apiVersion": "batch/v1", "kind": "CronJob",
+            "metadata": {"name": a.name, "namespace": a.namespace, "labels": dict(labels)},
+            "spec": {"schedule": a.schedule, "timeZone": a.time_zone,
+                     "concurrencyPolicy": a.concurrency_policy, "startingDeadlineSeconds": 600,
+                     "successfulJobsHistoryLimit": 3, "failedJobsHistoryLimit": 3,
+                     "jobTemplate": {"metadata": {"labels": dict(labels)}, "spec": job_spec}},
+        }
+    else:
+        workload = {"apiVersion": "batch/v1", "kind": "Job",
+                    "metadata": {"name": a.name, "namespace": a.namespace, "labels": dict(labels)},
+                    "spec": job_spec}
+    return [configmap, workload]
+
+
+def _str_presenter(dumper, data):
+    # Multi-line strings (the embedded executor template) as readable literal blocks.
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+def main(argv=None):
+    a = parse_args(sys.argv[1:] if argv is None else argv)
+    yaml.SafeDumper.add_representer(str, _str_presenter)
+    yaml.safe_dump_all(render(a), sys.stdout, sort_keys=False)
+
+
+if __name__ == "__main__":
+    main()

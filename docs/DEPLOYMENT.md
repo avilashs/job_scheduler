@@ -18,7 +18,7 @@ by how far it has actually been verified.
 |---|---|---|---|
 | PriorityClasses | `deploy/cluster/priorityclasses.yaml` | ✅ Ready | Applied to a live v1.33 apiserver. Quota scoping and preemption policy were exercised. |
 | API Priority & Fairness | `deploy/cluster/apf.yaml` | ✅ Ready | Applied. Live requests from the watcher and spark-driver identities were classified into `jobsched-control-plane` and `spark-drivers`. No dangling FlowSchemas. |
-| Admission policies (6 VAPs) | `deploy/cluster/admission-policies.yaml` | ✅ Ready | Applied. All CEL type-checks are clean. 59 allow/deny cases pass (`test/policy-tests.sh`). |
+| Admission policies (8 VAPs) | `deploy/cluster/admission-policies.yaml` | ✅ Ready | Applied. All CEL type-checks are clean. 77 allow/deny cases pass (`test/policy-tests.sh`). |
 | apiserver quota lock | `deploy/apiserver/admission-config.yaml` | ✅ Ready (self-managed only) | kube-apiserver started with it. A critical pod in a namespace without critical quota was refused. |
 | Control-plane RBAC | `deploy/control-plane/` | ✅ Ready | `can-i` matrix in the test suite. No identity can read Secrets. The tenant operator is confined. |
 | Tenant bundle | `deploy/tenants/tenant-acme/` | ✅ Ready, after you fill the placeholders (§2.2) | Applied. Quota exhaustion verified with real pods (7×16 CPU admitted, the 8th refused at 120). LimitRange defaults verified. |
@@ -26,6 +26,7 @@ by how far it has actually been verified.
 | Prometheus rules | `deploy/observability/prometheusrule.yaml` | ⚠️ Partial | Applied against the PrometheusRule CRD. The `kube_resourcequota` and apiserver metric names were checked against a live v1.33 apiserver. **Not** checked with `promtool`. All `jobsched_*` metrics depend on code that does not exist. |
 | Postgres schema | `schema/metadata.sql` | ⚠️ Partial | Loads on PostgreSQL 16. Lease takeover and ledger admission were exercised. Row-level security and partition automation are **not** included (step 5). |
 | NetworkPolicies | `deploy/tenants/tenant-acme/networkpolicy.yaml` | ⚠️ Schema-valid only | **Enforcement not tested**: the verification environment had no CNI. Run the connectivity checks in step 9. |
+| Spark native mode (Job/CronJob driver, no operator) | `tools/jobsched-spark-submit`, VAPs 7–8 | ✅ Ready | **Real Apache Spark 3.5.3** ran in client mode against the test apiserver with only the tenant's `spark-driver` token, pointed at a driver pod the Job controller created. Spark created its executor pods, and admission accepted them: tier PriorityClass, `spark-executor` SA without a token, PSA restricted, LimitRange, quota (driver + 2 executors = 3 CPU / 4224Mi charged). After a `kill -9` of the driver, deleting the Job garbage-collected the driver and both orphaned executors within 1 s, and the quota returned to 0. Control runs: without the executor template, and with the permission-less `spark-executor` token, Spark was refused. The real executor pod is kept as a test fixture. 18 checks in total. |
 | Spark cron scheduling (interim) | `examples/scheduled-sparkapplication.yaml`, `deploy/tenants/*/scheduling-interim.yaml`, VAP 6 | ✅ Ready, through the Spark Operator's `ScheduledSparkApplication` (§4) | 20 checks: template rules, frequency, concurrency and retry bounds. A replayed cron tick (the run the operator creates, built the way the v2.2.1 controller source builds it) was admitted under the operator's identity. The operator's cron firing itself was not run here. |
 | Scheduler / API / submitter / syncer / triggers | — | ❌ **Not implemented** | Only `deploy/control-plane-workloads/scheduler.yaml` exists, as a reference shape. Its image does not exist. |
 | Tenant Operator | — | ❌ **Not implemented** | Onboarding is manual (step 6) until it exists. |
@@ -288,7 +289,7 @@ own Deployment under its own ServiceAccount: the scheduler and syncer as `jobsch
 test/policy-tests.sh tenant-acme
 ```
 
-Expected result: `Result: 59 passed, 0 failed`. If the operator release is not `spark-operator-0`, set
+Expected result: `Result: 77 passed, 0 failed`. If the operator release is not `spark-operator-0`, set
 `OPERATOR_SA=system:serviceaccount:spark-operator:<release>-controller`. An unreachable webhook is reported as a
 failure, never as a correct denial. Run it for every tenant namespace you onboard.
 
@@ -342,7 +343,12 @@ evicted, and that an adhoc pod never evicts anything (`preemptionPolicy: Never`)
 
 ## 4. Scheduling Spark jobs
 
-There are two ways Spark jobs get scheduled. Only the first is available today.
+There are two ways Spark jobs get scheduled. Only the first is available today. It comes in two flavours,
+depending on how the job runs:
+
+* **Operator mode:** a `ScheduledSparkApplication`, run by the Spark Operator (§4.1).
+* **Native mode:** a Kubernetes `CronJob` whose pod is the Spark driver, which then creates its own executor
+  pods. No Spark Operator is needed (§4.5). Generate it with `tools/jobsched-spark-submit`.
 
 | | **Interim: operator cron** (available now) | **Full design: jobsched DAGs** (needs the scheduler) |
 |---|---|---|
@@ -439,7 +445,50 @@ Use the smoke-test pattern: a SparkApplication with `restartPolicy: Never`, subm
 kubectl create -f one-off.yaml --as system:serviceaccount:jobsched-system:jobsched-submitter
 ```
 
-### 4.4 Moving to jobsched DAGs later
+### 4.5 Native mode: Spark as a Kubernetes Job or CronJob (no Spark Operator)
+
+`tools/jobsched-spark-submit` takes the familiar `spark-submit` arguments and renders Kubernetes objects. It needs
+`python3` with PyYAML. Run it from the repository root.
+
+**Schedule a Spark job (CronJob), as a tenant developer:**
+
+```bash
+tools/jobsched-spark-submit --name nightly-pi --namespace tenant-acme --tier standard --schedule '15 2 * * *' --time-zone America/New_York --retries 2 --class org.apache.spark.examples.SparkPi --num-executors 4 --executor-cores 2 --executor-memory 4g /opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar 10000 | kubectl apply -f -
+```
+
+**Run one now (Job), as the platform team** (tenants cannot create Jobs directly):
+
+```bash
+tools/jobsched-spark-submit --name pi-once --namespace tenant-acme --tier adhoc --class org.apache.spark.examples.SparkPi /opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar 100 | kubectl apply -f - --as system:serviceaccount:jobsched-system:jobsched-submitter
+```
+
+Each run creates a driver pod (`job-name=<name>...`), and the driver creates executor pods (`spark-role=executor`).
+The executors are owned by the driver pod and deleted with it.
+
+```bash
+kubectl -n tenant-acme get cronjob,jobs,pods -l app.kubernetes.io/name=nightly-pi
+```
+
+```bash
+kubectl -n tenant-acme logs job/<job-name>
+```
+
+To pause, set `spec.suspend: true` on the CronJob. To cancel a run, delete its Job.
+
+* The image must contain Spark at `/opt/spark` (the official `spark:3.5.x` images do), and the application file must
+  be a path inside the image.
+* Options the tool sets (namespace, ServiceAccounts, ports, pod template, executor sizing flags) cannot be
+  overridden with `--conf`; it refuses with an error. Anything else passes through.
+* Exit code 42 from the application means "do not retry".
+* **Do not run plain `spark-submit` against a tenant namespace without the tool's executor template.** Spark then
+  builds executors with no PriorityClass or securityContext. Admission refuses them, and Spark retries the refused
+  create about **once per second, indefinitely**: 34 failing POSTs in 35 s in testing. The per-namespace
+  `spark-drivers` APF level confines the load to that tenant, but the app never starts. Look for `violates PodSecurity`
+  or `denied request` in the driver log.
+* Strict network mode: add one NetworkPolicy per app, keyed on `jobsched.io/attempt-id` (= `--name`, or
+  `sched-<name>` for CronJobs), exactly as in §4.2.
+
+### 4.6 Moving to jobsched DAGs later
 
 Each ScheduledSparkApplication becomes a one-task DAG (`examples/dag.yaml` format):
 * `schedule` / `timeZone` become a `cron` trigger;
@@ -471,4 +520,7 @@ tenant bundle when the tenant has migrated.
   real, but nothing that needs running pods is (Spark execution, NetworkPolicy enforcement, preemption).
 * The Spark Operator CRD and Helm chart **v2.2.1** (official release), and the PrometheusRule CRD (v0.83.0).
 * **PostgreSQL 16**, loaded with the schema plus scripted lease and ledger scenarios.
+* **Apache Spark 3.5.3** (official binary distribution, SHA-512 verified) on Java 21, in client mode against the test
+  apiserver. Executors cannot *run* without nodes, so the test proves creation, admission, ownership and GC, not
+  execution. A kubelet stand-in marked the driver pod Running/Ready, because Spark waits for its own pod to be Ready.
 * Not run: `promtool` (the review environment did not allow downloading and executing it). Use the command in step 7.

@@ -621,7 +621,49 @@ VAP `jobsched-scheduledsparkapplication-guardrails` checks every template when t
 frequency (every 5 minutes at most), forbids `concurrencyPolicy: Allow`, caps run history at 5 and names at 30
 characters. Without it, a bad template would only show up as a failed run at its first tick.
 
-Migration: each schedule maps 1:1 onto a single-task DAG with a cron trigger (DEPLOYMENT.md §4.4).
+Migration: each schedule maps 1:1 onto a single-task DAG with a cron trigger (DEPLOYMENT.md §4.6).
+
+### 4.7 Native execution mode: Spark as a plain Kubernetes Job (no Spark Operator)
+
+A second execution backend for Spark tasks uses only core Kubernetes primitives. The submitter renders a
+`batch/v1 Job` whose single pod is the **Spark driver in client mode** (`spark-submit --deploy-mode client`).
+Spark's built-in Kubernetes scheduler backend, inside that pod, then **creates the executor pods itself** through
+the API, authenticated as the tenant's `spark-driver` ServiceAccount. The reference renderer is
+[`tools/jobsched-spark-submit`](../tools/jobsched-spark-submit). It takes `spark-submit`-style arguments and
+emits a ConfigMap plus a Job, or a CronJob with `--schedule`.
+
+```
+Job (tenant ns) ──► driver pod  [spark-driver SA, jobsched-<tier>-driver, spark-role=driver]
+                     │  spark-submit --deploy-mode client
+                     │  spark.kubernetes.driver.pod.name=$(POD_NAME)
+                     └─► executor pods ×N  [built from the ConfigMap executor template:
+                          spark-executor SA (no token), jobsched-<tier>-executor, restricted securityContext,
+                          ownerReference → driver pod]
+```
+
+| Concern | How native mode handles it |
+|---|---|
+| Executor PriorityClass, SA, securityContext, labels | Executor **pod template** (`spark.kubernetes.executor.podTemplateFile`, mounted from a ConfigMap). This is the job the operator's webhook does in operator mode. |
+| Executor CPU limits | Rendered explicitly (`spark.kubernetes.executor.limit.cores`). Otherwise the LimitRange's default limit would sit below the request, and the pod would be rejected. |
+| Driver ↔ executor networking | `spark.driver.host=$(POD_IP)` with the fixed ports 7078/7079. No driver Service is needed. The existing `spark-role` NetworkPolicies apply unchanged. |
+| Cleanup | Executors carry an ownerReference to the driver pod. Job TTL deletes the pod, and the garbage collector deletes the executors. |
+| Retries | `backoffLimit: 0` when the scheduler owns retries. For cron (interim), up to 3. `podFailurePolicy` ignores `DisruptionTarget`, so preemption re-runs the driver without using a retry. Exit code 42 fails the Job immediately (non-retryable). |
+| State tracking | The syncer watches the Job and pods it already watches: `Complete` → SUCCESS, `Failed` → RETRYING/FAILED. The driver's termination message carries outputs (§1.5). |
+| Guardrails | VAPs `jobsched-job-guardrails` and `jobsched-cronjob-guardrails` (SA allowlist, explicit TTL/deadline/backoff, frequency and concurrency bounds), plus tier ceiling, PSA, quotas and LimitRange on every driver and executor pod. |
+
+**Operator mode vs native mode**
+
+| | Spark Operator (`SparkApplication`) | Native (`Job` + client-mode driver) |
+|---|---|---|
+| Extra components | Operator + mutating webhook (in the pod-creation path, fail-closed) | none |
+| Scheduling primitive for interim cron | `ScheduledSparkApplication` | `CronJob` |
+| Spark UI, history, app-level status | Rich (`status.applicationState`, executor counts) | Driver pod and Job status only. Use the Spark UI / History Server. |
+| Driver pod creation | The operator runs spark-submit in cluster mode | The Job controller creates the driver pod directly |
+| API load | Operator watches plus driver watches | Driver watches only |
+| Failure modes | Webhook outage blocks all Spark pods | Fewer moving parts. A bad executor template fails at executor creation (validated by the test suite). |
+
+Both modes produce pods with identical labels, tiers and security. A tenant or a task can choose its mode, and
+the scheduler's admission (§4 step 3) computes the same footprint for both: driver plus N executors.
 
 ---
 
@@ -704,6 +746,7 @@ spark.storage.decommission.shuffleBlocks.enabled=true
 | CoreDNS from executors | DNS timeouts | NodeLocal DNSCache |
 | Pod IP exhaustion | Pods stuck `ContainerCreating` | Prefix delegation, or a CNI overlay sized for 100k+ pods |
 | Image pulls at scale | Slow startup | Pre-pulled base Spark images (DaemonSet), image streaming, a registry mirror per zone |
+| Misconfigured Spark executors (native mode) | Spark retries a refused executor create about once per second, indefinitely (measured: 34 POSTs in 35 s) | The renderer always injects the executor template. The `spark-drivers` APF level (ByNamespace) confines the load to one tenant. The syncer fails an attempt whose driver has run for more than 5 min with 0 registered executors. |
 
 ---
 
@@ -769,10 +812,12 @@ deploy/control-plane/
   namespace.yaml  rbac.yaml           ← control-plane identities, split by privilege
 deploy/control-plane-workloads/scheduler.yaml ← reference Deployment + PDB (no image yet)
 deploy/spark-operator/values-shard-0.yaml     ← Helm values for one operator shard
+tools/jobsched-spark-submit           ← spark-submit → Job/CronJob renderer (native mode, §4.7)
+test/fixtures/                        ← executor pod captured from real Spark 3.5.3
 deploy/tenants/tenant-acme/           ← one tenant's full guardrail bundle (kustomize)
   namespace.yaml  resourcequota.yaml  limitrange.yaml  rbac.yaml  networkpolicy.yaml  kustomization.yaml
 deploy/observability/prometheusrule.yaml
-test/policy-tests.sh                  ← dry-run guardrail verification (59 checks), safe on live clusters
+test/policy-tests.sh                  ← dry-run guardrail verification (77 checks, incl. real Spark executor pods), safe on live clusters
 examples/dag.yaml                     ← DAG DSL
 examples/sparkapplication.yaml        ← rendered CR, as submitted
 examples/per-attempt-networkpolicy.yaml
