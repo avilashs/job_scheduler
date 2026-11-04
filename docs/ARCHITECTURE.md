@@ -594,6 +594,35 @@ These follow the same flow, rendered as `batch/v1 Job` with `backoffLimit: 0`, `
 `podFailurePolicy` (exit code 42 = non-retryable, `DisruptionTarget` → `PREEMPTED`), the tier PriorityClass, and
 `serviceAccountName: job-runner`. For multi-pod workloads, use `completionMode: Indexed` or JobSet.
 
+### 4.6 Interim mode: operator-native cron for Spark
+
+Until the scheduler control plane exists, teams schedule Spark jobs with the Spark Operator's
+`ScheduledSparkApplication`, applied directly in their own namespace
+([`examples/scheduled-sparkapplication.yaml`](../examples/scheduled-sparkapplication.yaml); how-to in
+[DEPLOYMENT.md §4](DEPLOYMENT.md#4-scheduling-spark-jobs)).
+
+At each cron tick, the operator's controller creates `SparkApplication <name>-<UnixNano>`. Its spec is the template
+copied verbatim, and it carries the schedule's labels plus `sparkoperator.k8s.io/scheduled-app-name`. That run then
+goes through steps 6–9 above unchanged: pod admission, tier ceiling, quotas, PSA, NetworkPolicy. What it skips is
+steps 1–5:
+* no DAG dependencies, event triggers or output passing;
+* no footprint ledger or fair share. ResourceQuota is the only capacity control, so the driver/executor quota
+  deadlock (§4 step 3) is possible under contention. Mitigate with staggered schedules, `concurrencyPolicy: Forbid`,
+  and fixed executor counts.
+
+The guardrails adapt in two narrow ways:
+
+| Rule | Normal | Interim exception |
+|---|---|---|
+| `restartPolicy` | must be `Never` (the scheduler owns retries) | `OnFailure` with ≤ 3 retries, **only** for a SparkApplication created by a `spark-operator` ServiceAccount *and* labelled `sparkoperator.k8s.io/scheduled-app-name`. Nothing else retries these runs. |
+| Who can create Spark work | only `jobsched-submitter` | tenant developers may manage `ScheduledSparkApplication`s (ClusterRole `jobsched-tenant-spark-scheduler`), never SparkApplications or pods directly |
+
+VAP `jobsched-scheduledsparkapplication-guardrails` checks every template when the schedule is created. It also caps
+frequency (every 5 minutes at most), forbids `concurrencyPolicy: Allow`, caps run history at 5 and names at 30
+characters. Without it, a bad template would only show up as a failed run at its first tick.
+
+Migration: each schedule maps 1:1 onto a single-task DAG with a cron trigger (DEPLOYMENT.md §4.4).
+
 ---
 
 ## 5. Scalability
@@ -743,11 +772,12 @@ deploy/spark-operator/values-shard-0.yaml     ← Helm values for one operator s
 deploy/tenants/tenant-acme/           ← one tenant's full guardrail bundle (kustomize)
   namespace.yaml  resourcequota.yaml  limitrange.yaml  rbac.yaml  networkpolicy.yaml  kustomization.yaml
 deploy/observability/prometheusrule.yaml
-test/policy-tests.sh                  ← dry-run guardrail verification (39 checks), safe on live clusters
+test/policy-tests.sh                  ← dry-run guardrail verification (59 checks), safe on live clusters
 examples/dag.yaml                     ← DAG DSL
 examples/sparkapplication.yaml        ← rendered CR, as submitted
 examples/per-attempt-networkpolicy.yaml
 examples/smoke-sparkpi.yaml           ← post-deploy end-to-end smoke test
+examples/scheduled-sparkapplication.yaml ← interim cron scheduling of a Spark job (§4.6)
 ```
 
 ## 9. Key trade-offs

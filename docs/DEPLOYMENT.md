@@ -18,7 +18,7 @@ by how far it has actually been verified.
 |---|---|---|---|
 | PriorityClasses | `deploy/cluster/priorityclasses.yaml` | ✅ Ready | Applied to a live v1.33 apiserver. Quota scoping and preemption policy were exercised. |
 | API Priority & Fairness | `deploy/cluster/apf.yaml` | ✅ Ready | Applied. Live requests from the watcher and spark-driver identities were classified into `jobsched-control-plane` and `spark-drivers`. No dangling FlowSchemas. |
-| Admission policies (5 VAPs) | `deploy/cluster/admission-policies.yaml` | ✅ Ready | Applied. All CEL type-checks are clean. 39 allow/deny cases pass (`test/policy-tests.sh`). |
+| Admission policies (6 VAPs) | `deploy/cluster/admission-policies.yaml` | ✅ Ready | Applied. All CEL type-checks are clean. 59 allow/deny cases pass (`test/policy-tests.sh`). |
 | apiserver quota lock | `deploy/apiserver/admission-config.yaml` | ✅ Ready (self-managed only) | kube-apiserver started with it. A critical pod in a namespace without critical quota was refused. |
 | Control-plane RBAC | `deploy/control-plane/` | ✅ Ready | `can-i` matrix in the test suite. No identity can read Secrets. The tenant operator is confined. |
 | Tenant bundle | `deploy/tenants/tenant-acme/` | ✅ Ready, after you fill the placeholders (§2.2) | Applied. Quota exhaustion verified with real pods (7×16 CPU admitted, the 8th refused at 120). LimitRange defaults verified. |
@@ -26,6 +26,7 @@ by how far it has actually been verified.
 | Prometheus rules | `deploy/observability/prometheusrule.yaml` | ⚠️ Partial | Applied against the PrometheusRule CRD. The `kube_resourcequota` and apiserver metric names were checked against a live v1.33 apiserver. **Not** checked with `promtool`. All `jobsched_*` metrics depend on code that does not exist. |
 | Postgres schema | `schema/metadata.sql` | ⚠️ Partial | Loads on PostgreSQL 16. Lease takeover and ledger admission were exercised. Row-level security and partition automation are **not** included (step 5). |
 | NetworkPolicies | `deploy/tenants/tenant-acme/networkpolicy.yaml` | ⚠️ Schema-valid only | **Enforcement not tested**: the verification environment had no CNI. Run the connectivity checks in step 9. |
+| Spark cron scheduling (interim) | `examples/scheduled-sparkapplication.yaml`, `deploy/tenants/*/scheduling-interim.yaml`, VAP 6 | ✅ Ready, through the Spark Operator's `ScheduledSparkApplication` (§4) | 20 checks: template rules, frequency, concurrency and retry bounds. A replayed cron tick (the run the operator creates, built the way the v2.2.1 controller source builds it) was admitted under the operator's identity. The operator's cron firing itself was not run here. |
 | Scheduler / API / submitter / syncer / triggers | — | ❌ **Not implemented** | Only `deploy/control-plane-workloads/scheduler.yaml` exists, as a reference shape. Its image does not exist. |
 | Tenant Operator | — | ❌ **Not implemented** | Onboarding is manual (step 6) until it exists. |
 
@@ -48,8 +49,8 @@ by how far it has actually been verified.
 ### 1.3 Verdict
 
 * **Safe to deploy to a staging cluster now:** steps 1–7 and 9. This puts the tenant guardrails, quotas,
-  priorities, APF and Spark Operator in place. Workloads can run through the guardrails, for example the SparkPi
-  smoke test submitted as the submitter identity.
+  priorities, APF and Spark Operator in place. **Teams can schedule Spark jobs on cron right away** (§4),
+  within all the guardrails. DAG dependencies, event triggers and fair-share admission wait for the scheduler.
 * **Before production:** verify NetworkPolicy enforcement on your CNI (step 9.3), run promtool over the rules,
   roll the VAPs out in `Warn` first (step 2), and size the quotas to your actual capacity (§2.2).
 * **Not deployable:** the scheduler control plane (step 8), until it is implemented.
@@ -287,7 +288,9 @@ own Deployment under its own ServiceAccount: the scheduler and syncer as `jobsch
 test/policy-tests.sh tenant-acme
 ```
 
-Expected result: `Result: 39 passed, 0 failed`. Run it for every tenant namespace you onboard.
+Expected result: `Result: 59 passed, 0 failed`. If the operator release is not `spark-operator-0`, set
+`OPERATOR_SA=system:serviceaccount:spark-operator:<release>-controller`. An unreachable webhook is reported as a
+failure, never as a correct denial. Run it for every tenant namespace you onboard.
 
 #### 9.2 End-to-end Spark smoke test (exercises the webhook, PSA, quotas and network policy)
 
@@ -337,7 +340,119 @@ evicted, and that an adhoc pod never evicts anything (`preemptionPolicy: Never`)
 
 ---
 
-## 4. Rollback
+## 4. Scheduling Spark jobs
+
+There are two ways Spark jobs get scheduled. Only the first is available today.
+
+| | **Interim: operator cron** (available now) | **Full design: jobsched DAGs** (needs the scheduler) |
+|---|---|---|
+| How | `ScheduledSparkApplication`, the Spark Operator's own cron controller | DAG with a `spark` task, submitted to the jobsched API ([ARCHITECTURE.md §4](ARCHITECTURE.md#4-execution-flow--lifecycle-of-a-spark-task)) |
+| Cron schedule, time zone | ✅ | ✅ |
+| Retries | ✅ operator retries, at most 3 | ✅ scheduler retries with backoff, re-admitted against quota |
+| Skip or replace overlapping runs | ✅ `concurrencyPolicy: Forbid` / `Replace` | ✅ `maxActiveRuns` |
+| Pause / resume | ✅ `spec.suspend` | ✅ |
+| Run now (manual) | ⚠️ Platform team only: submit a one-off SparkApplication as the submitter identity (see §4.3) | ✅ API / UI |
+| Dependencies between jobs | ❌ | ✅ |
+| Kafka / webhook triggers | ❌ | ✅ |
+| Pass outputs between jobs | ❌ (use object-storage paths by convention) | ✅ |
+| Fair share across tenants, full-footprint admission | ❌ (ResourceQuota is the only limit) | ✅ |
+| Guardrails (tier ceiling, quotas, PSA, LimitRange, NetworkPolicy, ServiceAccounts) | ✅ identical | ✅ |
+
+### 4.1 For tenant teams: schedule a Spark job
+
+1. Copy [`examples/scheduled-sparkapplication.yaml`](../examples/scheduled-sparkapplication.yaml) and change:
+   * `metadata.name`: at most 30 characters.
+   * `schedule` / `timeZone`: standard 5-field cron, or `@hourly` / `@daily`. The fastest allowed is every 5 minutes.
+   * The `template`: image, main class or file, arguments, and driver and executor sizes. It is an ordinary
+     SparkApplication spec.
+   * The tier: `priorityClassName` on the driver and executor (`jobsched-<tier>-driver` / `-executor`), up to
+     your namespace's `jobsched.io/max-tier`. Set the `jobsched.io/tier` label to match.
+   * `jobsched.io/attempt-id`: set it to `sched-<name>` on **both** the driver and the executor.
+
+   **Keep these as they are, or the schedule is rejected:**
+   * the `spark-driver` / `spark-executor` ServiceAccounts;
+   * `concurrencyPolicy: Forbid` or `Replace`;
+   * `timeToLiveSeconds`;
+   * `restartPolicy`: `Never`, or `OnFailure` with `onFailureRetries` ≤ 3.
+2. Apply it. A rejected schedule fails *now*, with the reason, not at run time:
+
+   ```bash
+   kubectl apply -f my-job.yaml
+   ```
+
+3. Check that it is scheduled. Look at `LAST RUN`, `NEXT RUN` and `STATE`:
+
+   ```bash
+   kubectl -n tenant-acme get scheduledsparkapplication
+   ```
+
+4. Follow its runs and read driver logs:
+
+   ```bash
+   kubectl -n tenant-acme get sparkapplications -l sparkoperator.k8s.io/scheduled-app-name=<name>
+   ```
+
+   ```bash
+   kubectl -n tenant-acme logs <run-name>-driver
+   ```
+
+5. Pause, cancel a running run, or remove the schedule:
+
+   ```bash
+   kubectl -n tenant-acme patch scheduledsparkapplication <name> --type merge -p '{"spec":{"suspend":true}}'
+   ```
+
+   ```bash
+   kubectl -n tenant-acme delete sparkapplication <run-name>
+   ```
+
+   ```bash
+   kubectl -n tenant-acme delete scheduledsparkapplication <name>
+   ```
+
+**Capacity advice (interim):** nothing reserves capacity for your runs ahead of time, so ResourceQuota is the only
+limit. If several large jobs start at once, their drivers can use up the quota before their executors start.
+To avoid that:
+* Stagger start times, for example `15 2 * * *` and `40 2 * * *` rather than everything at `0 2`.
+* Prefer a fixed `executor.instances` over a large `dynamicAllocation.maxExecutors`.
+* Size jobs so the ones that may overlap fit inside your quota together.
+
+### 4.2 For the platform team
+
+* The tenant bundle grants this through `scheduling-interim.yaml`, a RoleBinding from the tenant's developer group
+  to ClusterRole `jobsched-tenant-spark-scheduler`. That role covers ScheduledSparkApplications only, plus read and
+  cancel on their runs. Teams still cannot create SparkApplications, Jobs or pods directly.
+* Each tenant may hold 50 schedules (`count/scheduledsparkapplications.sparkoperator.k8s.io` in `compute`).
+* **Strict network-mode tenants:** no per-attempt NetworkPolicy is created for cron runs, so drivers and executors
+  cannot reach each other until you add one per schedule. Use
+  [`examples/per-attempt-networkpolicy.yaml`](../examples/per-attempt-networkpolicy.yaml) with
+  `jobsched.io/attempt-id: sched-<name>` and no `ownerReferences`. Apply it as cluster-admin; the submitter policy
+  restricts only the submitter identity.
+* Failed runs: the operator exposes Prometheus metrics (enabled in `values-shard-0.yaml`). Alert on its
+  application-failure counter. Check the exact metric name on your operator version's `/metrics` endpoint.
+
+### 4.3 One-off ("run now") Spark job, platform team
+
+Use the smoke-test pattern: a SparkApplication with `restartPolicy: Never`, submitted as the submitter identity.
+
+```bash
+kubectl create -f one-off.yaml --as system:serviceaccount:jobsched-system:jobsched-submitter
+```
+
+### 4.4 Moving to jobsched DAGs later
+
+Each ScheduledSparkApplication becomes a one-task DAG (`examples/dag.yaml` format):
+* `schedule` / `timeZone` become a `cron` trigger;
+* `template` becomes the task's `spark:` block;
+* `concurrencyPolicy: Forbid` becomes `maxActiveRuns: 1`;
+* `restartPolicy` retries become task `retries`.
+
+Once a DAG has run successfully, delete the ScheduledSparkApplication. Remove `scheduling-interim.yaml` from the
+tenant bundle when the tenant has migrated.
+
+---
+
+## 5. Rollback
 
 | Undo | Command | Notes |
 |---|---|---|
@@ -349,7 +464,7 @@ evicted, and that an adhoc pod never evicts anything (`preemptionPolicy: Never`)
 
 ---
 
-## 5. How this was verified
+## 6. How this was verified
 
 * A real **kube-apiserver v1.33.1 + etcd 3.5 + kube-controller-manager**. kind could not start pods in the review
   sandbox (nested runc), so no kubelet or CNI was available. Everything at the API and admission layer is therefore

@@ -33,7 +33,7 @@ metadata:
   name: jobsched-submitter
 rules:
   - apiGroups: ["sparkoperator.k8s.io"]
-    resources: ["sparkapplications"]
+    resources: ["sparkapplications", "scheduledsparkapplications"]
     verbs: ["create", "get", "delete", "patch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -55,7 +55,7 @@ metadata:
   name: jobsched-watcher
 rules:
   - apiGroups: ["sparkoperator.k8s.io"]
-    resources: ["sparkapplications"]
+    resources: ["sparkapplications", "scheduledsparkapplications"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -94,7 +94,7 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles"]
     verbs: ["bind"]
-    resourceNames: ["jobsched-submitter", "jobsched-tenant-viewer", "jobsched-tenant-admin", "jobsched-spark-driver"]
+    resourceNames: ["jobsched-submitter", "jobsched-tenant-viewer", "jobsched-tenant-admin", "jobsched-spark-driver", "jobsched-tenant-spark-scheduler"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
@@ -135,11 +135,28 @@ rules:
     resources: ["pods", "pods/log", "events", "services", "configmaps", "resourcequotas", "limitranges"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["sparkoperator.k8s.io"]
-    resources: ["sparkapplications"]
+    resources: ["sparkapplications", "scheduledsparkapplications"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch"]
+---
+# INTERIM: lets a tenant's own team manage cron schedules for Spark jobs until the scheduler exists.
+# It grants ScheduledSparkApplications only. Teams still cannot create SparkApplications, Jobs or pods
+# directly. Each run executes as the namespace's spark-driver SA, inside the namespace's quotas,
+# PriorityClass ceiling, PSA and NetworkPolicies. Every template is checked by VAP
+# jobsched-scheduledsparkapplication-guardrails. Remove the binding once DAG scheduling is live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-tenant-spark-scheduler
+rules:
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["scheduledsparkapplications"]
+    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["get", "list", "watch", "delete"]     # inspect runs; delete = cancel a run
 ---
 # Break-glass: granted just-in-time (e.g. via an access broker), time-bound.
 apiVersion: rbac.authorization.k8s.io/v1

@@ -8,3 +8,4 @@ resources:
   - limitrange.yaml
   - rbac.yaml
   - networkpolicy.yaml
+  - scheduling-interim.yaml        # interim Spark cron scheduling; remove when the scheduler is live

@@ -20,6 +20,7 @@ spec:
     configmaps: "1000"
     secrets: "200"
     count/sparkapplications.sparkoperator.k8s.io: "500"
+    count/scheduledsparkapplications.sparkoperator.k8s.io: "50"
     count/jobs.batch: "1000"
     services.loadbalancers: "0"
     services.nodeports: "0"

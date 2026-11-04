@@ -1,0 +1,9 @@
+# INTERIM Spark cron scheduling (docs/DEPLOYMENT.md §4). Lets tenant-acme's developers manage
+# ScheduledSparkApplications in their own namespace. Delete this file from the bundle once
+# DAG scheduling through the jobsched API is live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: tenant-acme-spark-scheduler, namespace: tenant-acme }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-tenant-spark-scheduler }
+subjects:
+  - { kind: Group, name: "oidc:tenant-acme-developers", apiGroup: rbac.authorization.k8s.io }

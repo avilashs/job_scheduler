@@ -25,8 +25,17 @@ spec:
       message: "driver must run as ServiceAccount spark-driver"
     - expression: "!has(object.spec.executor.serviceAccount) || object.spec.executor.serviceAccount == 'spark-executor'"
       message: "executors must run as ServiceAccount spark-executor"
-    - expression: "has(object.spec.restartPolicy) && object.spec.restartPolicy.type == 'Never'"
-      message: "retries are owned by the scheduler; restartPolicy.type must be Never"
+    # Scheduler-submitted apps: the scheduler owns retries, so restartPolicy must be Never.
+    # Exception (interim, until the scheduler exists): runs the Spark Operator creates from a
+    # ScheduledSparkApplication may use bounded operator retries, because nothing else retries them.
+    - expression: >-
+        has(object.spec.restartPolicy) && (object.spec.restartPolicy.type == 'Never' ||
+          (request.userInfo.username.startsWith('system:serviceaccount:spark-operator:') &&
+           has(object.metadata.labels) && 'sparkoperator.k8s.io/scheduled-app-name' in object.metadata.labels &&
+           object.spec.restartPolicy.type == 'OnFailure' &&
+           has(object.spec.restartPolicy.onFailureRetries) && object.spec.restartPolicy.onFailureRetries <= 3 &&
+           (!has(object.spec.restartPolicy.onSubmissionFailureRetries) || object.spec.restartPolicy.onSubmissionFailureRetries <= 3)))
+      message: "restartPolicy.type must be Never (retries are owned by the scheduler); scheduled runs may use OnFailure with <= 3 retries"
     - expression: >-
         has(object.spec.driver.labels) && 'jobsched.io/attempt-id' in object.spec.driver.labels &&
         has(object.spec.executor.labels) && 'jobsched.io/attempt-id' in object.spec.executor.labels &&
@@ -218,7 +227,8 @@ spec:
   validations:
     - expression: >-
         object.roleRef.kind == 'ClusterRole' &&
-        object.roleRef.name in ['jobsched-submitter', 'jobsched-tenant-viewer', 'jobsched-tenant-admin', 'jobsched-spark-driver']
+        object.roleRef.name in ['jobsched-submitter', 'jobsched-tenant-viewer', 'jobsched-tenant-admin', 'jobsched-spark-driver',
+                                 'jobsched-tenant-spark-scheduler']
       message: "rolebinding must reference an approved platform ClusterRole"
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -227,4 +237,67 @@ metadata:
   name: jobsched-tenant-operator-rolebindings
 spec:
   policyName: jobsched-tenant-operator-rolebindings
+  validationActions: ["Deny", "Audit"]
+---
+# 6) ScheduledSparkApplication (operator-native cron; the interim way to schedule Spark until the
+#    scheduler exists). The operator copies spec.template verbatim into each run, and policy 1 judges
+#    the run. This policy checks the same rules when the schedule is CREATED, so a bad template fails
+#    at `kubectl apply` rather than silently at 2am. It also bounds frequency, concurrency and history.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-scheduledsparkapplication-guardrails
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - { key: jobsched.io/tenant, operator: Exists }
+    resourceRules:
+      - apiGroups: ["sparkoperator.k8s.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["scheduledsparkapplications"]
+  variables:
+    - name: t
+      expression: "object.spec.template"
+  validations:
+    - expression: "size(object.metadata.name) <= 30"
+      message: "name must be <= 30 characters (each run is named <name>-<19-digit timestamp>)"
+    - expression: >-
+        !object.spec.schedule.startsWith('@every') &&
+        !object.spec.schedule.trim().matches('^(\\*|\\*/[1-4]|0-59)(\\s|$)')
+      message: "schedules may run at most every 5 minutes (no '* ...', '*/1-4 ...' or '@every')"
+    - expression: "has(object.spec.concurrencyPolicy) && object.spec.concurrencyPolicy in ['Forbid', 'Replace']"
+      message: "concurrencyPolicy must be Forbid or Replace (Allow lets runs pile up and exhaust quota)"
+    - expression: >-
+        (!has(object.spec.successfulRunHistoryLimit) || object.spec.successfulRunHistoryLimit <= 5) &&
+        (!has(object.spec.failedRunHistoryLimit) || object.spec.failedRunHistoryLimit <= 5)
+      message: "run history limits must be <= 5 to keep etcd small"
+    - expression: "has(variables.t.driver.serviceAccount) && variables.t.driver.serviceAccount == 'spark-driver'"
+      message: "template.driver must run as ServiceAccount spark-driver"
+    - expression: "!has(variables.t.executor.serviceAccount) || variables.t.executor.serviceAccount == 'spark-executor'"
+      message: "template.executor must run as ServiceAccount spark-executor"
+    - expression: >-
+        has(variables.t.restartPolicy) && (variables.t.restartPolicy.type == 'Never' ||
+          (variables.t.restartPolicy.type == 'OnFailure' &&
+           has(variables.t.restartPolicy.onFailureRetries) && variables.t.restartPolicy.onFailureRetries <= 3 &&
+           (!has(variables.t.restartPolicy.onSubmissionFailureRetries) || variables.t.restartPolicy.onSubmissionFailureRetries <= 3)))
+      message: "template.restartPolicy must be Never, or OnFailure with onFailureRetries <= 3"
+    - expression: >-
+        has(variables.t.driver.labels) && 'jobsched.io/attempt-id' in variables.t.driver.labels &&
+        has(variables.t.executor.labels) && 'jobsched.io/attempt-id' in variables.t.executor.labels &&
+        variables.t.driver.labels['jobsched.io/attempt-id'] == variables.t.executor.labels['jobsched.io/attempt-id']
+      message: "template driver and executor must carry the same jobsched.io/attempt-id label"
+    - expression: "!has(variables.t.volumes) || variables.t.volumes.all(v, !has(v.hostPath))"
+      message: "hostPath volumes are not allowed"
+    - expression: "has(variables.t.timeToLiveSeconds) && variables.t.timeToLiveSeconds <= 86400"
+      message: "template.timeToLiveSeconds is required (<= 86400)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-scheduledsparkapplication-guardrails
+spec:
+  policyName: jobsched-scheduledsparkapplication-guardrails
   validationActions: ["Deny", "Audit"]

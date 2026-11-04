@@ -10,6 +10,8 @@ ValidatingAdmissionPolicy.
 > **Status:** the cluster guardrail layer (priorities, APF, admission policies, RBAC, tenant quotas and
 > policies, Spark Operator values) is verified against a live v1.33 apiserver and ready for staging.
 > The scheduler application itself is **not implemented** yet. See DEPLOYMENT.md §1 for the evidence and gaps.
+> **Spark jobs can be scheduled on cron today** through the Spark Operator, inside all guardrails:
+> see [DEPLOYMENT.md §4](docs/DEPLOYMENT.md#4-scheduling-spark-jobs).
 
 | Section | Covers |
 |---|---|
@@ -33,8 +35,8 @@ deploy/control-plane-workloads/      Reference scheduler Deployment + PDB (no im
 deploy/spark-operator/               Helm values for one Spark Operator shard
 deploy/tenants/tenant-acme/          Complete per-tenant guardrail bundle (kustomize)
 deploy/observability/                PrometheusRule (recording rules + alerts)
-examples/                            DAG DSL, rendered SparkApplication, per-attempt NetworkPolicy, SparkPi smoke test
-test/policy-tests.sh                 39 guardrail checks; dry-run only, safe on live clusters
+examples/                            DAG DSL, rendered SparkApplication, scheduled (cron) Spark job, per-attempt NetworkPolicy, SparkPi smoke test
+test/policy-tests.sh                 59 guardrail checks; dry-run only, safe on live clusters
 ```
 
 ## Quick start (staging)

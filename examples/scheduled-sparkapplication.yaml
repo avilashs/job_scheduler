@@ -1,0 +1,70 @@
+# Interim Spark scheduling: a nightly Spark job on the Spark Operator's own cron controller.
+# A tenant developer applies this directly in their namespace:
+#   kubectl apply -f examples/scheduled-sparkapplication.yaml
+# Every night at 02:15 America/New_York the operator creates a SparkApplication named
+# nightly-sparkpi-<timestamp> from `template`. That run passes the same admission checks as any
+# other workload: tier ceiling, quotas, PSA restricted, LimitRange, NetworkPolicy.
+#
+# Day-to-day operations:
+#   kubectl -n tenant-acme get scheduledsparkapplication nightly-sparkpi        # LAST RUN / NEXT RUN / STATE
+#   kubectl -n tenant-acme get sparkapplications -l sparkoperator.k8s.io/scheduled-app-name=nightly-sparkpi
+#   kubectl -n tenant-acme patch scheduledsparkapplication nightly-sparkpi --type merge -p '{"spec":{"suspend":true}}'
+#   kubectl -n tenant-acme logs <run-name>-driver
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: ScheduledSparkApplication
+metadata:
+  name: nightly-sparkpi                  # <= 30 chars: runs are named <name>-<19-digit timestamp>
+  namespace: tenant-acme
+  labels:
+    jobsched.io/managed: "true"          # copied onto every run by the operator
+    jobsched.io/tier: standard
+spec:
+  schedule: "15 2 * * *"                 # standard 5-field cron (or @daily / @hourly); >= every 5 min
+  timeZone: America/New_York
+  concurrencyPolicy: Forbid              # skip a tick if the previous run is still going
+  successfulRunHistoryLimit: 3
+  failedRunHistoryLimit: 3
+  template:
+    type: Scala
+    mode: cluster
+    sparkVersion: "3.5.3"
+    image: docker.io/library/spark:3.5.3
+    mainClass: org.apache.spark.examples.SparkPi
+    mainApplicationFile: local:///opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar
+    arguments: ["10000"]
+    restartPolicy:                       # operator retries (allowed only for scheduled runs, max 3)
+      type: OnFailure
+      onFailureRetries: 2
+      onFailureRetryInterval: 300
+      onSubmissionFailureRetries: 3
+      onSubmissionFailureRetryInterval: 60
+    timeToLiveSeconds: 86400             # keep the finished run's CR for a day, then GC
+    sparkConf:
+      spark.driver.port: "7078"
+      spark.blockManager.port: "7079"
+      spark.kubernetes.allocation.batch.size: "10"
+      spark.kubernetes.executor.enablePollingWithResourceVersion: "true"
+      spark.ui.prometheus.enabled: "true"
+    driver:
+      cores: 1
+      coreLimit: "1"
+      memory: 2g
+      serviceAccount: spark-driver
+      priorityClassName: jobsched-standard-driver
+      labels:
+        jobsched.io/managed: "true"
+        jobsched.io/attempt-id: sched-nightly-sparkpi   # static per schedule (see strict-mode note in DEPLOYMENT.md)
+      podSecurityContext: { runAsNonRoot: true, runAsUser: 185, fsGroup: 185, seccompProfile: { type: RuntimeDefault } }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+    executor:
+      instances: 4
+      cores: 2
+      coreLimit: "2"
+      memory: 4g
+      serviceAccount: spark-executor
+      priorityClassName: jobsched-standard-executor
+      labels:
+        jobsched.io/managed: "true"
+        jobsched.io/attempt-id: sched-nightly-sparkpi
+      podSecurityContext: { runAsNonRoot: true, runAsUser: 185, fsGroup: 185, seccompProfile: { type: RuntimeDefault } }
+      securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }

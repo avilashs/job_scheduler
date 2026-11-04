@@ -4,7 +4,8 @@
 # runs in full but nothing is persisted. RBAC checks use `kubectl auth can-i` with impersonation.
 #
 # Requirements: kubectl >= 1.30, cluster-admin (for --as impersonation), the manifests in deploy/
-# already applied, and tenant namespace $NS onboarded with max-tier=critical.
+# already applied, tenant namespace $NS onboarded with max-tier=critical (bundle incl. scheduling-interim.yaml),
+# and a Spark Operator shard installed whose controller SA is $OPERATOR_SA.
 #
 # Usage: test/policy-tests.sh [tenant-namespace]      (default: tenant-acme)
 set -uo pipefail
@@ -14,6 +15,9 @@ SUB=system:serviceaccount:jobsched-system:jobsched-submitter
 WATCH=system:serviceaccount:jobsched-system:jobsched-watcher
 TOP=system:serviceaccount:jobsched-system:jobsched-tenant-operator
 DRV=system:serviceaccount:$NS:spark-driver
+# Spark Operator controller SA. The chart names it <release>-controller; override with OPERATOR_SA.
+OPSA=${OPERATOR_SA:-system:serviceaccount:spark-operator:spark-operator-0-controller}
+DEVG="oidc:$NS-developers"
 EXE=system:serviceaccount:$NS:spark-executor
 pass=0; fail=0
 ok()  { echo "  PASS  $1"; pass=$((pass+1)); }
@@ -23,7 +27,8 @@ bad() { echo "  FAIL  $1"; [ -n "${2:-}" ] && echo "        $2"; fail=$((fail+1)
 expect() {
   local want=$1 desc=$2 src=$3; shift 3
   local out; out=$(kubectl create --dry-run=server -f "$src" "$@" 2>&1); local rc=$?
-  if [ "$want" = allow ] && [ $rc -eq 0 ]; then ok "$desc"
+  if echo "$out" | grep -q "failed calling webhook"; then bad "$desc (a webhook is unreachable; the result says nothing about policy)" "$(echo "$out" | grep -o 'failed calling webhook "[^"]*"' | head -1)"
+  elif [ "$want" = allow ] && [ $rc -eq 0 ]; then ok "$desc"
   elif [ "$want" = deny ] && [ $rc -ne 0 ]; then ok "$desc  -> $(echo "$out" | grep -oE '(denied|forbidden|Forbidden|must|exceeded|violates|Invalid)[^"]{0,90}' | head -1)"
   else bad "$desc (wanted $want, rc=$rc)" "$(echo "$out" | head -2)"; fi
 }
@@ -38,6 +43,26 @@ spark_variant() { python3 - "$ROOT/examples/sparkapplication.yaml" "$NS" "$1" <<
 import sys, yaml, json
 d = yaml.safe_load(open(sys.argv[1])); d['metadata']['namespace'] = sys.argv[2]
 exec(sys.argv[3]); print(json.dumps(d))
+PY
+}
+# ScheduledSparkApplication from the example with a mutation applied to d.
+sched_variant() { python3 - "$ROOT/examples/scheduled-sparkapplication.yaml" "$NS" "$1" <<'PY'
+import sys, yaml, json
+d = yaml.safe_load(open(sys.argv[1])); d['metadata']['namespace'] = sys.argv[2]
+exec(sys.argv[3]); print(json.dumps(d))
+PY
+}
+# The SparkApplication the operator creates at a cron tick (mirrors spark-operator v2.2.1
+# scheduledsparkapplication controller: name <name>-<UnixNano>, labels copied + scheduled-app-name,
+# spec = template verbatim).
+scheduled_run() { python3 - "$ROOT/examples/scheduled-sparkapplication.yaml" "$NS" "${1:-pass}" <<'PY'
+import sys, yaml, json, time
+d = yaml.safe_load(open(sys.argv[1])); name = d['metadata']['name']
+labels = dict(d['metadata'].get('labels', {})); labels['sparkoperator.k8s.io/scheduled-app-name'] = name
+r = {"apiVersion": "sparkoperator.k8s.io/v1beta2", "kind": "SparkApplication",
+     "metadata": {"name": f"{name}-{time.time_ns()}", "namespace": sys.argv[2], "labels": labels},
+     "spec": d['spec']['template']}
+exec(sys.argv[3]); print(json.dumps(r))
 PY
 }
 pod() { # pod <priorityClass> [python mutation of p]
@@ -74,6 +99,28 @@ expect allow "container with no resources gets LimitRange defaults" <(pod jobsch
 gpus=$(kubectl create --dry-run=server -o jsonpath='{.spec.containers[0].resources.requests}' -f <(pod jobsched-adhoc-executor "del p['spec']['containers'][0]['resources']") 2>&1)
 case "$gpus" in *gpu*) bad "defaulted container must not request GPUs" "$gpus";; *) ok "defaulted container requests no GPUs ($gpus)";; esac
 expect deny "container above LimitRange max cpu" <(pod jobsched-adhoc-executor "p['spec']['containers'][0]['resources']={'requests':{'cpu':'32','memory':'1Gi'},'limits':{'cpu':'32','memory':'1Gi'}}")
+echo "== Scheduled Spark jobs (interim cron: ScheduledSparkApplication)"
+expect allow "example nightly schedule (as tenant developer)" <(sched_variant "pass") --as dev --as-group $DEVG
+expect allow "every-5-minutes schedule" <(sched_variant "d['spec']['schedule']='*/5 * * * *'") --as dev --as-group $DEVG
+expect allow "@daily schedule" <(sched_variant "d['spec']['schedule']='@daily'") --as dev --as-group $DEVG
+expect deny "every-minute schedule" <(sched_variant "d['spec']['schedule']='* * * * *'") --as dev --as-group $DEVG
+expect deny "every-2-minutes schedule" <(sched_variant "d['spec']['schedule']='*/2 * * * *'") --as dev --as-group $DEVG
+expect deny "@every 30s schedule" <(sched_variant "d['spec']['schedule']='@every 30s'") --as dev --as-group $DEVG
+expect deny "concurrencyPolicy Allow" <(sched_variant "d['spec']['concurrencyPolicy']='Allow'") --as dev --as-group $DEVG
+expect deny "missing concurrencyPolicy" <(sched_variant "del d['spec']['concurrencyPolicy']") --as dev --as-group $DEVG
+expect deny "run history above 5" <(sched_variant "d['spec']['successfulRunHistoryLimit']=50") --as dev --as-group $DEVG
+expect deny "name too long for run names" <(sched_variant "d['metadata']['name']='a-very-long-scheduled-spark-application'") --as dev --as-group $DEVG
+expect deny "template with a non-spark-driver ServiceAccount" <(sched_variant "d['spec']['template']['driver']['serviceAccount']='default'") --as dev --as-group $DEVG
+expect deny "template with 10 operator retries" <(sched_variant "d['spec']['template']['restartPolicy']['onFailureRetries']=10") --as dev --as-group $DEVG
+expect deny "template missing timeToLiveSeconds" <(sched_variant "del d['spec']['template']['timeToLiveSeconds']") --as dev --as-group $DEVG
+expect deny "template with a hostPath volume" <(sched_variant "d['spec']['template']['volumes']=[{'name':'h','hostPath':{'path':'/'}}]") --as dev --as-group $DEVG
+expect allow "cron tick: run created by the operator from the template" <(scheduled_run) --as $OPSA
+expect deny "OnFailure retries outside a schedule (as submitter)" <(scheduled_run) --as $SUB
+expect deny "OnFailure retries without the scheduled-app label (as operator)" <(scheduled_run "del r['metadata']['labels']['sparkoperator.k8s.io/scheduled-app-name']") --as $OPSA
+can yes "tenant developers can manage their schedules"           dev create scheduledsparkapplications.sparkoperator.k8s.io $NS --as-group "$DEVG"
+can yes "tenant developers can cancel a run"                     dev delete sparkapplications.sparkoperator.k8s.io $NS --as-group "$DEVG"
+can no  "tenant developers cannot schedule in another namespace" dev create scheduledsparkapplications.sparkoperator.k8s.io default --as-group "$DEVG"
+
 echo "== Submitter NetworkPolicy shape (VAP jobsched-submitter-networkpolicy-shape)"
 expect allow "per-attempt policy (as submitter)" <(sed "s/namespace: tenant-acme/namespace: $NS/" "$ROOT/examples/per-attempt-networkpolicy.yaml") --as $SUB
 expect deny "broad allow-all policy (as submitter)" - --as $SUB <<NP
