@@ -5,7 +5,11 @@ Design and reference manifests for a distributed scheduler that runs DAGs of Apa
 Each tenant is confined by ResourceQuota, LimitRange, RBAC, NetworkPolicy, PriorityClass and
 ValidatingAdmissionPolicy.
 
-**Start here → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+**Start here → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** (design) · **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** (readiness + runbook)
+
+> **Status:** the cluster guardrail layer (priorities, APF, admission policies, RBAC, tenant quotas and
+> policies, Spark Operator values) is verified against a live v1.33 apiserver and ready for staging.
+> The scheduler application itself is **not implemented** yet. See DEPLOYMENT.md §1 for the evidence and gaps.
 
 | Section | Covers |
 |---|---|
@@ -19,24 +23,41 @@ ValidatingAdmissionPolicy.
 ## Layout
 
 ```
-schema/metadata.sql              Postgres DDL (state, fenced leases, admission ledger, outbox)
-deploy/cluster/                  PriorityClasses, APF, ValidatingAdmissionPolicies, apiserver admission config
-deploy/control-plane/            Namespace, split-privilege RBAC, scheduler Deployment + PDB
-deploy/tenants/tenant-acme/      Complete per-tenant guardrail bundle (kustomize)
-deploy/observability/            PrometheusRule (recording rules + alerts)
-examples/                        DAG DSL, rendered SparkApplication, per-attempt NetworkPolicy
+docs/ARCHITECTURE.md                 Design
+docs/DEPLOYMENT.md                   Readiness assessment, prerequisites, step-by-step runbook, rollback
+schema/metadata.sql                  Postgres DDL (state, fenced leases, admission ledger, outbox)
+deploy/apiserver/                    kube-apiserver AdmissionConfiguration (self-managed control planes only)
+deploy/cluster/                      PriorityClasses, APF, ValidatingAdmissionPolicies
+deploy/control-plane/                Namespace and split-privilege RBAC
+deploy/control-plane-workloads/      Reference scheduler Deployment + PDB (no image yet; not applied by default)
+deploy/spark-operator/               Helm values for one Spark Operator shard
+deploy/tenants/tenant-acme/          Complete per-tenant guardrail bundle (kustomize)
+deploy/observability/                PrometheusRule (recording rules + alerts)
+examples/                            DAG DSL, rendered SparkApplication, per-attempt NetworkPolicy, SparkPi smoke test
+test/policy-tests.sh                 39 guardrail checks; dry-run only, safe on live clusters
 ```
 
-## Applying the reference manifests
+## Quick start (staging)
 
-Requires Kubernetes ≥ 1.30 (ValidatingAdmissionPolicy v1, APF v1) and Spark Operator v2 CRDs installed.
+Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). It lists placeholders you must fill first (apiserver CIDR,
+egress gateway, OIDC groups, quota sizes). The short version:
 
 ```bash
-kubectl apply -f deploy/cluster/priorityclasses.yaml -f deploy/cluster/apf.yaml -f deploy/cluster/admission-policies.yaml
-kubectl apply -f deploy/control-plane/
-kubectl apply -k deploy/tenants/tenant-acme/
+kubectl apply --server-side -f deploy/cluster/priorityclasses.yaml -f deploy/cluster/apf.yaml -f deploy/cluster/admission-policies.yaml
 ```
 
-`deploy/cluster/apiserver-admission-config.yaml` is a kube-apiserver flag file for self-managed
-control planes. On managed Kubernetes, the `jobsched-tier-ceiling` policy enforces the same rule.
-Before applying `networkpolicy.yaml`, replace the apiserver CIDR in `allow-driver-to-apiserver`.
+```bash
+kubectl apply --server-side -f deploy/control-plane/
+```
+
+```bash
+kubectl apply --server-side -k deploy/tenants/tenant-acme/
+```
+
+```bash
+helm install spark-operator-0 spark-operator/spark-operator --version 2.2.1 -n spark-operator --create-namespace -f deploy/spark-operator/values-shard-0.yaml
+```
+
+```bash
+test/policy-tests.sh tenant-acme
+```

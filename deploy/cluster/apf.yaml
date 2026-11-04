@@ -103,10 +103,9 @@ spec:
     type: ByNamespace
   rules:
     - subjects:
+        # One entry per tenant namespace; the Tenant Operator appends on onboarding.
         - kind: ServiceAccount
           serviceAccount: { namespace: tenant-acme, name: spark-driver }
-        - kind: ServiceAccount
-          serviceAccount: { namespace: tenant-globex, name: spark-driver }
       resourceRules:
         - verbs: ["*"]
           apiGroups: [""]

@@ -1,0 +1,30 @@
+# Helm values for one Spark Operator shard (chart kubeflow/spark-operator 2.2.x).
+# Install one release per shard, each with a DISJOINT spark.jobNamespaces list:
+#   helm install spark-operator-0 kubeflow/spark-operator -n spark-operator --version 2.2.1 -f values-shard-0.yaml
+# The release namespace must be `spark-operator`, because the APF FlowSchema matches that namespace.
+controller:
+  replicas: 2                 # leader-elected; the second is a warm standby
+  workers: 30
+  priorityClassName: jobsched-control-plane
+  podDisruptionBudget:
+    enable: true
+    minAvailable: 1
+webhook:
+  enable: true                # REQUIRED: applies priorityClassName, securityContext, env, secrets, GPUs to pods
+  replicas: 3
+  failurePolicy: Fail         # fail closed: an unmutated pod would bypass tier and security settings
+  timeoutSeconds: 5
+  priorityClassName: jobsched-control-plane
+  podDisruptionBudget:
+    enable: true
+    minAvailable: 2
+spark:
+  jobNamespaces:              # the tenant namespaces owned by this shard (kept by the Tenant Operator)
+    - tenant-acme
+  serviceAccount:
+    create: false             # the tenant bundle provides spark-driver / spark-executor
+  rbac:
+    create: false             # driver permissions come from ClusterRole jobsched-spark-driver
+prometheus:
+  metrics:
+    enable: true

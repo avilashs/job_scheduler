@@ -1,5 +1,7 @@
--- Metadata store (PostgreSQL 16). Every row carries tenant_id; the API also enables
--- row-level security so a bug in tenant filtering cannot leak another tenant's rows.
+-- Metadata store (PostgreSQL 16). Tenant-owned tables carry tenant_id.
+-- NOT included here (deployment step, see docs/DEPLOYMENT.md): row-level security policies keyed
+-- on a per-session tenant setting for the API role, and monthly partitions for the partitioned tables.
+-- Inserts into task_attempt / state_transition / outbox FAIL until a partition covering now() exists.
 
 CREATE TYPE task_state AS ENUM (
   'PENDING','QUEUED','ADMITTED','SUBMITTED','RUNNING',

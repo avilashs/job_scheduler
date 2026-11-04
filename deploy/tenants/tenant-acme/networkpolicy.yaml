@@ -116,7 +116,8 @@ spec:
           podSelector:
             matchLabels: { app.kubernetes.io/name: prometheus }
       ports:
-        - { protocol: TCP, port: 8090 }   # JMX / Prometheus exporter
+        - { protocol: TCP, port: 4040 }   # spark.ui.prometheus.enabled servlet (/metrics/executors/prometheus)
+        - { protocol: TCP, port: 8090 }   # optional JMX exporter
     - from:
         - namespaceSelector:
             matchLabels: { kubernetes.io/metadata.name: jobsched-system }

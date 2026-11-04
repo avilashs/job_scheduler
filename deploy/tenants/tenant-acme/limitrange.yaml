@@ -1,5 +1,14 @@
 # Defaults ensure no BestEffort pods slip past quota accounting. Maximums stop one pod
 # from taking a whole node. maxLimitRequestRatio limits overcommit inside the tenant.
+#
+# Two rules this file must keep:
+#  * default / defaultRequest must satisfy maxLimitRequestRatio themselves, or every pod that
+#    omits resources is rejected (memory 1536Mi / 1Gi = 1.5).
+#  * Never list an extended resource (nvidia.com/gpu) under `max` without a `default`:
+#    Kubernetes uses `max` as the default limit, so EVERY container would request that many GPUs.
+#    GPU caps are enforced by ResourceQuota (requests.nvidia.com/gpu) instead.
+#  * A container that sets a request above the default limit, but no limit, is rejected
+#    (request > defaulted limit). The submitter always renders explicit limits.
 apiVersion: v1
 kind: LimitRange
 metadata:
@@ -9,9 +18,9 @@ spec:
   limits:
     - type: Container
       defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 1Gi }
-      default:        { cpu: "1",  memory: 2Gi, ephemeral-storage: 4Gi }
+      default:        { cpu: "1",  memory: 1536Mi, ephemeral-storage: 4Gi }
       min:            { cpu: 100m, memory: 128Mi }
-      max:            { cpu: "16", memory: 120Gi, ephemeral-storage: 200Gi, nvidia.com/gpu: "4" }
+      max:            { cpu: "16", memory: 120Gi, ephemeral-storage: 200Gi }
       maxLimitRequestRatio:
         cpu: "4"
         memory: "1.5"

@@ -55,3 +55,14 @@ value: 1000
 preemptionPolicy: Never
 globalDefault: false
 description: "Ad-hoc / dev executors. First to be evicted."
+---
+# Control plane (scheduler, submitter, syncer, API). Above all tenant work so it is never
+# preempted by it, but below system-cluster-critical, which is reserved for core cluster components.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: jobsched-control-plane
+value: 2000000
+preemptionPolicy: PreemptLowerPriority
+globalDefault: false
+description: "jobsched control-plane components."

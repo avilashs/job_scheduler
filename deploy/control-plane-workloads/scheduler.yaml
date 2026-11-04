@@ -1,3 +1,8 @@
+# NOT YET DEPLOYABLE. The scheduler/submitter/syncer/API/trigger implementation and the image
+# ghcr.io/avilashs/jobsched do not exist yet; applying this yields ImagePullBackOff.
+# It is kept here as the reference shape (HA, zone spread, PDB, probes, hardening) and lives outside
+# deploy/control-plane/ so that `kubectl apply -f deploy/control-plane/` stays safe. It also needs
+# Secret jobsched-db (key: dsn) in jobsched-system. See docs/DEPLOYMENT.md, step 8.
 # Scheduler: active-active over 256 fenced shards (leases in Postgres), spread across zones.
 # The submitter, syncer, API and trigger Deployments follow the same pattern with different --mode flags.
 apiVersion: apps/v1
@@ -17,7 +22,7 @@ spec:
       labels: { app.kubernetes.io/name: jobsched, app.kubernetes.io/component: scheduler }
     spec:
       serviceAccountName: jobsched-watcher
-      priorityClassName: system-cluster-critical
+      priorityClassName: jobsched-control-plane
       terminationGracePeriodSeconds: 30      # graceful shard release
       topologySpreadConstraints:
         - maxSkew: 1

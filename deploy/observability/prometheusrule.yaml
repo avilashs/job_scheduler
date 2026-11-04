@@ -50,11 +50,18 @@ spec:
     - name: jobsched.scheduler.alerts
       rules:
         - alert: JobschedShardsUnowned
-          expr: sum(jobsched_shard_owned) < 256
+          # `or vector(0)`: if every replica is down the metric vanishes, and a bare sum would never fire.
+          expr: (sum(jobsched_shard_owned) or vector(0)) < 256
           for: 1m
           labels: { severity: critical }
           annotations:
             summary: "Only {{ $value }} of 256 scheduler shards are owned. DAGs on unowned shards are not being scheduled."
+        - alert: JobschedSchedulerAbsent
+          expr: absent(up{job="jobsched-scheduler"} == 1)
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "No healthy jobsched-scheduler target is being scraped."
         - alert: JobschedShardDoubleOwnership
           expr: sum by (shard) (jobsched_shard_owned) > 1
           for: 2m

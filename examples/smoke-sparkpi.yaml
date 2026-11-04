@@ -1,0 +1,48 @@
+# Post-deployment smoke test: the smallest SparkApplication that satisfies every guardrail
+# (VAPs, PSA restricted, LimitRange, quotas, NetworkPolicy ports). Submit it AS the submitter
+# identity, so the real write path is exercised:
+#   kubectl create -f examples/smoke-sparkpi.yaml --as system:serviceaccount:jobsched-system:jobsched-submitter
+#   kubectl -n tenant-acme get sparkapplication js-smoke-sparkpi-a1 -w     # expect COMPLETED
+# Uses the public Apache Spark image. Mirror it to your registry if nodes cannot reach Docker Hub.
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: js-smoke-sparkpi-a1
+  namespace: tenant-acme
+  labels:
+    jobsched.io/managed: "true"
+    jobsched.io/attempt-id: "smoke-1"
+    jobsched.io/tier: adhoc
+spec:
+  type: Scala
+  mode: cluster
+  sparkVersion: "3.5.3"
+  image: docker.io/library/spark:3.5.3
+  mainClass: org.apache.spark.examples.SparkPi
+  mainApplicationFile: local:///opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar
+  arguments: ["1000"]
+  restartPolicy: { type: Never }
+  timeToLiveSeconds: 600
+  sparkConf:
+    spark.driver.port: "7078"
+    spark.blockManager.port: "7079"
+    spark.kubernetes.allocation.batch.size: "10"
+  driver:
+    cores: 1
+    coreLimit: "1"
+    memory: 1g
+    serviceAccount: spark-driver
+    priorityClassName: jobsched-adhoc-driver
+    labels: { jobsched.io/managed: "true", jobsched.io/attempt-id: "smoke-1" }
+    podSecurityContext: { runAsNonRoot: true, runAsUser: 185, fsGroup: 185, seccompProfile: { type: RuntimeDefault } }
+    securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+  executor:
+    instances: 2
+    cores: 1
+    coreLimit: "1"
+    memory: 1g
+    serviceAccount: spark-executor
+    priorityClassName: jobsched-adhoc-executor
+    labels: { jobsched.io/managed: "true", jobsched.io/attempt-id: "smoke-1" }
+    podSecurityContext: { runAsNonRoot: true, runAsUser: 185, fsGroup: 185, seccompProfile: { type: RuntimeDefault } }
+    securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }

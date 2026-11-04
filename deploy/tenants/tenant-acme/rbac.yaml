@@ -14,22 +14,13 @@ kind: ServiceAccount
 metadata: { name: job-runner, namespace: tenant-acme }
 automountServiceAccountToken: false
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata: { name: spark-driver, namespace: tenant-acme }
-rules:
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
-  - apiGroups: [""]
-    resources: ["services", "configmaps", "persistentvolumeclaims"]
-    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
-  # Deliberately absent: secrets, pods/exec, rbac, networkpolicies, any cross-namespace access.
----
+# The permissions live in the platform ClusterRole jobsched-spark-driver (deploy/control-plane/rbac.yaml).
+# A RoleBinding grants them in this namespace only. The Tenant Operator then needs only `bind` on
+# that ClusterRole, not the permissions themselves cluster-wide.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata: { name: spark-driver, namespace: tenant-acme }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: spark-driver }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-spark-driver }
 subjects:
   - { kind: ServiceAccount, name: spark-driver, namespace: tenant-acme }
 ---
@@ -40,14 +31,8 @@ metadata: { name: jobsched-submitter, namespace: tenant-acme }
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-submitter }
 subjects:
   - { kind: ServiceAccount, name: jobsched-submitter, namespace: jobsched-system }
----
-# The Spark Operator shard that owns this namespace.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata: { name: spark-operator, namespace: tenant-acme }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: spark-operator-controller }
-subjects:
-  - { kind: ServiceAccount, name: spark-operator-controller-2, namespace: spark-operator }
+# The Spark Operator's own RBAC comes from its Helm chart (see docs/DEPLOYMENT.md, step 4).
+# This namespace must be listed in the owning shard's spark.jobNamespaces.
 ---
 # --- Humans (OIDC groups). Read-only: every submission goes through the scheduler API. -----
 apiVersion: rbac.authorization.k8s.io/v1

@@ -12,6 +12,19 @@ apiVersion: v1
 kind: ServiceAccount
 metadata: { name: jobsched-tenant-operator, namespace: jobsched-system }
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: jobsched-api, namespace: jobsched-system }
+---
+# The API validates task-output callbacks (projected SA tokens) with TokenReview.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jobsched-api-auth-delegator
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:auth-delegator }
+subjects:
+  - { kind: ServiceAccount, name: jobsched-api, namespace: jobsched-system }
+---
 # WRITE path. A ClusterRole is used only as a template: it is bound with a RoleBinding
 # inside each onboarded tenant namespace (see deploy/tenants/*/rbac.yaml), never cluster-wide.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -73,12 +86,15 @@ rules:
     resources: ["resourcequotas", "limitranges", "serviceaccounts"]
     verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
   - apiGroups: ["rbac.authorization.k8s.io"]
-    resources: ["roles", "rolebindings"]
+    resources: ["rolebindings"]
     verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+  # `bind` lets the operator create RoleBindings to these ClusterRoles without holding their
+  # permissions itself. No Roles are created per tenant, so there is no `roles` verb and no
+  # cluster-wide pod/service permission.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles"]
     verbs: ["bind"]
-    resourceNames: ["jobsched-submitter", "jobsched-tenant-viewer", "jobsched-tenant-admin"]
+    resourceNames: ["jobsched-submitter", "jobsched-tenant-viewer", "jobsched-tenant-admin", "jobsched-spark-driver"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
@@ -86,10 +102,6 @@ rules:
     resources: ["flowschemas"]
     resourceNames: ["spark-drivers"]
     verbs: ["get", "update", "patch"]
-  # Needed to grant spark-driver its namespaced Role (RBAC escalation check).
-  - apiGroups: [""]
-    resources: ["pods", "services", "configmaps", "persistentvolumeclaims"]
-    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -98,6 +110,20 @@ metadata:
 roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: jobsched-tenant-operator }
 subjects:
   - { kind: ServiceAccount, name: jobsched-tenant-operator, namespace: jobsched-system }
+---
+# Spark driver permissions, bound per tenant namespace to that namespace's spark-driver SA.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jobsched-spark-driver
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "watch", "delete", "deletecollection"]
+  # Deliberately absent: secrets, pods/exec, rbac, networkpolicies.
 ---
 # Role templates for humans, bound per tenant namespace to OIDC groups.
 apiVersion: rbac.authorization.k8s.io/v1

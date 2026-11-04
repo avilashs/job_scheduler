@@ -102,7 +102,7 @@ Each mode is its own Deployment so it can scale and fail on its own.
 | Component | Notes |
 |---|---|
 | **kube-apiserver** | Protected by dedicated API Priority & Fairness levels for the scheduler, the Spark Operator, and Spark drivers (per namespace). See §6 and `deploy/cluster/apf.yaml`. |
-| **Spark Operator** (Kubeflow `spark-operator` v2) | One cluster-wide install for each *operator shard*. Each shard watches a disjoint set of tenant namespaces (`spark.jobNamespaces`) so its reconcile throughput scales horizontally. Configured with `controller.workers=30`, the pod-template path rather than the mutating webhook where possible, and its own APF level. |
+| **Spark Operator** (Kubeflow `spark-operator` v2) | One cluster-wide install for each *operator shard*. Each shard watches a disjoint set of tenant namespaces (`spark.jobNamespaces`) so its reconcile throughput scales horizontally. Configured with `controller.workers=30` and its own APF level. **The operator's mutating webhook is required.** It is what applies `priorityClassName`, security contexts, env, secret volumes, tolerations and GPUs to driver and executor pods. Without it, the tier-ceiling policy and PSA reject every Spark pod. Run it with ≥3 replicas and `failurePolicy: Fail`. |
 | **Tenant namespaces** | One namespace per tenant per environment (`tenant-<name>`, or `tenant-<name>-<env>` for prod/non-prod split). Each one is created only by the **Tenant Operator** from a `Tenant` resource (or by GitOps). Each gets the full guardrail bundle: quota, limits, RBAC, NetworkPolicy, PSA labels. |
 | **Gang scheduler (optional)** | Apache YuniKorn or Volcano (`spec.batchScheduler`) for all-or-nothing placement of driver plus minimum executors on clusters with heavy overcommit. The scheduler's own footprint ledger (§4.2) already prevents quota deadlock, so this is an optimisation, not a requirement. |
 
@@ -217,7 +217,7 @@ Control-plane identities are split by privilege:
 |---|---|---|
 | `jobsched-submitter` | **RoleBinding in each tenant ns** to ClusterRole `jobsched-submitter` | create/delete/patch `sparkapplications`, `jobs`, `configmaps`, `networkpolicies` (strict mode); read pods/logs/events. **No secrets, no RBAC, no quotas.** |
 | `jobsched-watcher` | ClusterRoleBinding to `jobsched-watcher` (read-only) | `get/list/watch` sparkapplications, jobs, pods, resourcequotas, events. One cluster-wide label-filtered watch per type instead of N per-namespace watches. |
-| `jobsched-tenant-operator` | ClusterRole (privileged, separate Deployment, ideally replaced by GitOps) | Create namespaces, quotas, limitranges, roles and rolebindings, but only for namespaces labelled `jobsched.io/tenant`. Guarded by a VAP. |
+| `jobsched-tenant-operator` | ClusterRole (privileged, separate Deployment, ideally replaced by GitOps) | Create and label `tenant-*` namespaces only. Write quotas, limitranges, ServiceAccounts, NetworkPolicies and RoleBindings only inside namespaces labelled `jobsched.io/tenant`. Bind only the approved platform ClusterRoles, and only via `bind`. It holds no pod or Secret permissions. Enforced by RBAC plus the `jobsched-tenant-operator-scope` VAP. |
 
 Why the submitter uses a RoleBinding instead of a ClusterRoleBinding: if the submitter is compromised, it can only
 write in namespaces that were onboarded explicitly. Even there, `ValidatingAdmissionPolicy` (§2.6) limits what it
@@ -286,8 +286,10 @@ spec:
   sparkapplications, jobs, events. They cannot `create` SparkApplications directly. Every submission goes through
   the scheduler API, so DAG semantics, quotas and audit always apply. A break-glass `tenant-acme-admins` role adds
   `pods/exec` and `delete` and needs just-in-time elevation.
-* **`spark-driver` SA** (in each tenant ns) gets a Role limited to its own namespace: pods, services, configmaps and
-  PVCs that Spark needs to manage executors. It has no access to Secrets beyond what is mounted.
+* **`spark-driver` SA** (in each tenant ns) is granted the platform ClusterRole `jobsched-spark-driver` through a
+  RoleBinding, which limits it to its own namespace: pods, services, configmaps and PVCs that Spark needs to manage
+  executors. It has no access to Secrets beyond what is mounted. Because this is a binding to a ClusterRole rather
+  than a per-tenant Role, the Tenant Operator needs only `bind` on it, not those permissions cluster-wide.
 * **`spark-executor` / `job-runner` SAs** have no Role and `automountServiceAccountToken: false`. Executors never
   talk to the apiserver.
 
@@ -306,7 +308,7 @@ Baseline for each tenant namespace (all policies add up as allows on top of defa
 | `allow-driver-to-apiserver` | Drivers only: egress to the apiserver endpoints (`ipBlock`). |
 | `allow-egress-data-plane` | Egress to the tenant's object store, Kafka and DB endpoints through an egress gateway or FQDN policy (Cilium `toFQDNs` when available). |
 | `allow-jobsched-callbacks` | Egress to `jobsched-system/jobsched-api:8443` for output callbacks. |
-| `allow-observability` | Ingress from `monitoring/prometheus` on the metrics port, and from `jobsched-system/jobsched-api` (Spark UI proxy) on 4040. |
+| `allow-observability` | Ingress from `monitoring/prometheus` on 4040 (the `spark.ui.prometheus.enabled` servlet) and 8090 (optional JMX exporter), and from `jobsched-system/jobsched-api` (Spark UI proxy) on 4040. |
 
 **Strict mode** (for regulated tenants, set with namespace label `jobsched.io/network-mode=strict`): the namespace-wide
 intra-Spark allow is **not** installed. Instead the submitter creates a **per-attempt NetworkPolicy** that selects
@@ -563,7 +565,8 @@ kube-scheduler places them, preempting lower-priority pods if nodes are full.
   attempt with a new deterministic name goes back through admission.
 * **Timeout:** the reconciler deletes the CR once `now() - started_at > task.timeout`, and marks the attempt
   `FAILED(reason=Timeout)`.
-* **Cancel:** the API sets `cancel_requested`. The shard owner deletes the CR with
+* **Cancel:** the API sets `cancel_requested`. The shard owner enqueues a delete, and the submitter (the only
+  identity with write access to tenant namespaces) deletes the CR with
   `propagationPolicy: Foreground`, and the operator and GC clean up the driver, executors, services and per-attempt
   NetworkPolicy through ownerReferences.
 
@@ -579,7 +582,7 @@ ad-hoc work:
 
 1. Select victims from the same tenant's running attempts, lowest tier first and youngest first, which wastes the
    least work. Stop when the freed footprint is at least what is needed.
-2. Delete those CRs. Mark them `PREEMPTED`, which puts them back in `QUEUED` *without* using a retry.
+2. Have the submitter delete those CRs. Mark them `PREEMPTED`, which puts them back in `QUEUED` *without* using a retry.
 3. When their pods are gone, quota `used` drops, the ledger is released, and the critical task is admitted.
 
 Cross-tenant contention for *node capacity* is left to kube-scheduler's PriorityClass preemption, which is correct
@@ -665,7 +668,7 @@ spark.storage.decommission.shuffleBlocks.enabled=true
 | Bottleneck | Symptom | Mitigation |
 |---|---|---|
 | Cron storm at :00 | APF queueing, 429s, slow dispatch | Schedule smearing (§4 step 1), per-tenant fair queue, token bucket |
-| Spark Operator mutating webhook | Pod create latency, timeouts | Use operator v2 pod templates instead of the webhook. If the webhook is needed: ≥3 replicas, `timeoutSeconds: 5`, a namespaceSelector limited to tenant namespaces |
+| Spark Operator mutating webhook (required, §1.2) | Pod create latency, timeouts | ≥3 replicas with a PDB, `timeoutSeconds: 5`, a namespaceSelector limited to tenant namespaces, `failurePolicy: Fail`. Failing closed is intended: an unmutated pod would bypass tier and security settings. |
 | Single operator throughput | `SUBMITTED` backlog | Shard by namespace (§5), `controller.workers` |
 | etcd size and object count | apiserver memory, slow LISTs | TTLs, count quotas, separate events etcd, no large ConfigMaps (outputs go to DB or object storage) |
 | DB write amplification | Syncer lag | Write only on state change, batch transactions, partitioning |
@@ -727,19 +730,24 @@ Recording rules and alerts are in [`deploy/observability/prometheusrule.yaml`](.
 ```
 docs/ARCHITECTURE.md                  ← this document
 schema/metadata.sql                   ← Postgres DDL (state, leases, ledger, outbox)
+docs/DEPLOYMENT.md                    ← readiness status + step-by-step deployment runbook
+deploy/apiserver/admission-config.yaml ← kube-apiserver flag file: ResourceQuota limitedResources (self-managed only)
 deploy/cluster/
-  priorityclasses.yaml                ← 6 PriorityClasses (driver > executor per tier)
+  priorityclasses.yaml                ← 6 tenant PriorityClasses (driver > executor per tier) + control-plane class
   apf.yaml                            ← FlowSchemas + PriorityLevelConfigurations
   admission-policies.yaml             ← ValidatingAdmissionPolicies (CEL)
-  apiserver-admission-config.yaml     ← ResourceQuota limitedResources (self-managed control planes)
 deploy/control-plane/
-  namespace.yaml  rbac.yaml  scheduler.yaml
+  namespace.yaml  rbac.yaml           ← control-plane identities, split by privilege
+deploy/control-plane-workloads/scheduler.yaml ← reference Deployment + PDB (no image yet)
+deploy/spark-operator/values-shard-0.yaml     ← Helm values for one operator shard
 deploy/tenants/tenant-acme/           ← one tenant's full guardrail bundle (kustomize)
   namespace.yaml  resourcequota.yaml  limitrange.yaml  rbac.yaml  networkpolicy.yaml  kustomization.yaml
 deploy/observability/prometheusrule.yaml
+test/policy-tests.sh                  ← dry-run guardrail verification (39 checks), safe on live clusters
 examples/dag.yaml                     ← DAG DSL
 examples/sparkapplication.yaml        ← rendered CR, as submitted
 examples/per-attempt-networkpolicy.yaml
+examples/smoke-sparkpi.yaml           ← post-deploy end-to-end smoke test
 ```
 
 ## 9. Key trade-offs

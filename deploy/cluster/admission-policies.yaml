@@ -153,6 +153,8 @@ spec:
 ---
 # 4) The Tenant Operator, the only identity that writes quotas and RBAC, is confined to
 #    namespaces labelled as tenants and may bind only the platform's approved roles.
+#    It may create or update only namespaces named tenant-*. Without that rule it could
+#    label kube-system as a "tenant" and then write RBAC there.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -163,12 +165,16 @@ spec:
     resourceRules:
       - apiGroups: [""]
         apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["resourcequotas", "limitranges"]
+        resources: ["resourcequotas", "limitranges", "serviceaccounts"]
       - apiGroups: ["rbac.authorization.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
-        resources: ["roles", "rolebindings"]
+        resources: ["rolebindings"]
       - apiGroups: ["networking.k8s.io"]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE", "DELETE"]
@@ -178,12 +184,11 @@ spec:
       expression: "request.userInfo.username == 'system:serviceaccount:jobsched-system:jobsched-tenant-operator'"
   validations:
     - expression: >-
-        has(namespaceObject.metadata.labels) && 'jobsched.io/tenant' in namespaceObject.metadata.labels
-      message: "tenant operator may only write inside tenant namespaces"
-    - expression: >-
-        request.resource.resource != 'rolebindings' || request.operation == 'DELETE' ||
-        object.roleRef.name in ['jobsched-submitter', 'jobsched-tenant-viewer', 'jobsched-tenant-admin', 'spark-driver']
-      message: "rolebinding must reference an approved platform role"
+        request.resource.resource == 'namespaces'
+          ? object.metadata.name.startsWith('tenant-') &&
+            has(object.metadata.labels) && 'jobsched.io/tenant' in object.metadata.labels
+          : has(namespaceObject.metadata.labels) && 'jobsched.io/tenant' in namespaceObject.metadata.labels
+      message: "tenant operator may only manage tenant-* namespaces and write inside them"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -191,4 +196,35 @@ metadata:
   name: jobsched-tenant-operator-scope
 spec:
   policyName: jobsched-tenant-operator-scope
+  validationActions: ["Deny", "Audit"]
+---
+# 5) RoleBindings written by the Tenant Operator may reference only approved platform ClusterRoles.
+#    (Separate from policy 4 so `object.roleRef` type-checks: this policy matches RoleBindings only.)
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: jobsched-tenant-operator-rolebindings
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings"]
+  matchConditions:
+    - name: is-tenant-operator
+      expression: "request.userInfo.username == 'system:serviceaccount:jobsched-system:jobsched-tenant-operator'"
+  validations:
+    - expression: >-
+        object.roleRef.kind == 'ClusterRole' &&
+        object.roleRef.name in ['jobsched-submitter', 'jobsched-tenant-viewer', 'jobsched-tenant-admin', 'jobsched-spark-driver']
+      message: "rolebinding must reference an approved platform ClusterRole"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: jobsched-tenant-operator-rolebindings
+spec:
+  policyName: jobsched-tenant-operator-rolebindings
   validationActions: ["Deny", "Audit"]
